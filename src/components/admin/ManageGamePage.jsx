@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { io } from 'socket.io-client';
+import notificationSound from '../../assets/notification-sound.mp3'
 
 const ManageGamePage = () => {
   const [gameProfiles, setGameProfiles] = useState([]);
@@ -19,16 +21,141 @@ const ManageGamePage = () => {
     pendingRedeems: 0
   });
   
+  // WebSocket connection state
+  const socketRef = useRef(null);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [newNotification, setNewNotification] = useState(false);
+  
   const itemsPerPage = 10;
 
+  // Initialize WebSocket connection
   useEffect(() => {
-    fetchGameProfiles();
-    fetchStats();
+    // Initial data loading using REST API
+    fetchGameProfilesFallback();
+    fetchStatsFallback();
+    
+    // Create socket connection
+    const socket = io('http://localhost:5000', {
+      transports: ['websocket'],
+      autoConnect: true
+    });
+    
+    socketRef.current = socket;
+    
+    // Socket event handlers
+    socket.on('connect', () => {
+      console.log('Connected to WebSocket server');
+      setSocketConnected(true);
+      
+      // Authenticate with JWT token from localStorage
+      const token = localStorage.getItem('accessToken');
+      
+      if (!token) {
+        console.error('No authentication token found in localStorage');
+        setError('Authentication token not found');
+        return;
+      }
+      
+      console.log('Authenticating socket with token');
+      socket.emit('authenticate', token);
+    });
+    
+    socket.on('disconnect', () => {
+      console.log('Disconnected from WebSocket server');
+      setSocketConnected(false);
+    });
+    
+    socket.on('authenticated', (response) => {
+      console.log('Socket authentication response:', response);
+      if (response.success) {
+        console.log('Socket authenticated successfully');
+        // Request initial data
+        socket.emit('get:gameProfiles');
+        socket.emit('get:gameStatistics');
+      } else {
+        console.error('Socket authentication failed:', response.message);
+        setError('WebSocket authentication failed: ' + response.message);
+      }
+    });
+    
+    socket.on('gameProfiles', (data) => {
+      console.log('Received game profiles via WebSocket:', data);
+      if (data.success) {
+        // Check if there are any new pending profiles
+        const previousPendingCount = countPendingItems(gameProfiles);
+        const newPendingCount = countPendingItems(data.profiles || []);
+        
+        if (previousPendingCount < newPendingCount && gameProfiles.length > 0) {
+          setNewNotification(true);
+          // Try to play notification sound
+          try {
+            const audio = new Audio(notificationSound);
+            audio.play().catch(err => console.log('Unable to play notification sound', err));
+          } catch (err) {
+            console.log('Error playing notification sound:', err);
+          }
+        }
+        
+        // Log game profiles to debug Edit ID issue
+        console.log('Game profiles data:', JSON.stringify(data.profiles, null, 2));
+        
+        setGameProfiles(data.profiles || []);
+        setLoading(false);
+        setError(null);
+      } else {
+        setError(data.message || 'Failed to fetch game profiles');
+        setLoading(false);
+      }
+    });
+    
+    socket.on('gameStatistics', (data) => {
+      console.log('Received game statistics via WebSocket:', data);
+      const audio = new Audio(notificationSound);
+      audio.play().catch(err => console.log('Unable to play notification sound', err));
+      if (data.success && data.statistics) {
+        setStatsData({
+          totalProfiles: data.statistics.totalProfiles || 0,
+          pendingProfiles: data.statistics.totalPendingProfiles || 0,
+          pendingCredits: data.statistics.pendingCreditRequests || 0,
+          pendingRedeems: data.statistics.pendingRedeemRequests || 0
+        });
+      }
+    });
+    
+    socket.on('error', (error) => {
+      console.error('Socket error:', error);
+      setError(error.message || 'WebSocket error occurred');
+      setLoading(false);
+    });
+    
+    // Clean up socket connection when component unmounts
+    return () => {
+      socket.disconnect();
+    };
   }, []);
+  
+  // Helper function to count pending items
+  const countPendingItems = (profiles) => {
+    let count = 0;
+    profiles.forEach(profile => {
+      if (!profile.games || !Array.isArray(profile.games)) return;
+      
+      profile.games.forEach(game => {
+        if (game.profileStatus === 'pending' || 
+            game.creditAmount?.status === 'pending' || 
+            game.creditAmount?.status === 'pending_redeem') {
+          count++;
+        }
+      });
+    });
+    return count;
+  };
 
-  const fetchGameProfiles = async () => {
+  // Fallback functions to use REST API if WebSocket fails
+  const fetchGameProfilesFallback = async () => {
     setLoading(true);
     try {
+      console.log('Fetching game profiles using REST API...');
       const response = await fetch('http://localhost:5000/api/admin/games/profiles', {
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
@@ -40,6 +167,7 @@ const ManageGamePage = () => {
       }
       
       const data = await response.json();
+      console.log('REST API game profiles response:', data);
       
       if (data.success && data.profiles) {
         setGameProfiles(data.profiles);
@@ -56,8 +184,9 @@ const ManageGamePage = () => {
     }
   };
 
-  const fetchStats = async () => {
+  const fetchStatsFallback = async () => {
     try {
+      console.log('Fetching game statistics using REST API...');
       const response = await fetch('http://localhost:5000/api/admin/games/statistics', {
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
@@ -83,6 +212,76 @@ const ManageGamePage = () => {
     }
   };
 
+  // Refresh data function - use WebSocket if connected, otherwise REST API
+  const fetchGameProfiles = () => {
+    setNewNotification(false); // Clear notification when manually refreshing
+    setLoading(true); // Show loading state
+    
+    console.log('Manual refresh triggered');
+    
+    if (socketRef.current && socketConnected) {
+      console.log('Using WebSocket for manual refresh');
+      socketRef.current.emit('get:gameProfiles');
+      
+      // Add a fallback timer in case the socket request fails or times out
+      const fallbackTimer = setTimeout(() => {
+        console.log('Socket response timeout, falling back to REST API');
+        fetchGameProfilesFallback();
+      }, 3000); // 3 second timeout
+      
+      // Clear the fallback timer if we get a response
+      const handleResponse = () => {
+        clearTimeout(fallbackTimer);
+      };
+      
+      socketRef.current.once('gameProfiles', handleResponse);
+      
+      // Remove the event listener if component unmounts before response
+      return () => {
+        clearTimeout(fallbackTimer);
+        if (socketRef.current) {
+          socketRef.current.off('gameProfiles', handleResponse);
+        }
+      };
+    } else {
+      console.log('Using REST API for manual refresh (no socket connection)');
+      fetchGameProfilesFallback();
+    }
+  };
+
+  const fetchStats = () => {
+    if (socketRef.current && socketConnected) {
+      socketRef.current.emit('get:gameStatistics');
+    } else {
+      fetchStatsFallback();
+    }
+  };
+
+  // Function to broadcast updates after API calls
+  const broadcastUpdates = async () => {
+    setLoading(true);
+    console.log('Broadcasting updates after action');
+    
+    if (socketRef.current && socketConnected) {
+      console.log('Using WebSocket for updates');
+      socketRef.current.emit('get:gameProfiles');
+      socketRef.current.emit('get:gameStatistics');
+      
+      // Fallback to REST if socket doesn't respond within 3 seconds
+      setTimeout(() => {
+        if (loading) {
+          console.log('Socket not responding fast enough, using REST API');
+          fetchGameProfilesFallback();
+          fetchStatsFallback();
+        }
+      }, 3000);
+    } else {
+      console.log('Using REST API for updates (no socket connection)');
+      await fetchGameProfilesFallback();
+      await fetchStatsFallback();
+    }
+  };
+
   // Function to convert game profiles to table rows
   const getProfileRows = () => {
     let rows = [];
@@ -95,12 +294,18 @@ const ManageGamePage = () => {
       const email = profile.userData?.email || 'No email';
       
       profile.games.forEach(game => {
+        // Make sure gameId is correctly handled
+        const gameId = game.gameId || 'Not assigned';
+        
+        // Log each game to debug Edit ID issue
+        console.log(`Game for ${username}: ${game.gameName}, ID: ${gameId}, Status: ${game.profileStatus}, Credit Status: ${game.creditAmount?.status || 'none'}`);
+        
         const row = {
           userId,
           username,
           email,
           gameName: game.gameName,
-          gameId: game.gameId || 'Not assigned',
+          gameId: gameId, // Ensure we use the correct field
           profileStatus: game.profileStatus,
           creditAmount: game.creditAmount?.amount || 0,
           requestedAmount: game.creditAmount?.requestedAmount || 0,
@@ -159,6 +364,7 @@ const ManageGamePage = () => {
   const totalPages = Math.ceil(getProfileRows().length / itemsPerPage);
 
   const handleEditClick = (row) => {
+    console.log('Edit clicked for row:', row);
     setEditingProfile({
       userId: row.userId,
       username: row.username,
@@ -183,6 +389,7 @@ const ManageGamePage = () => {
 
     try {
       setSubmitting(true);
+      console.log('Saving game ID:', gameIdInput);
       
       const response = await fetch('http://localhost:5000/api/admin/games/assign-gameid', {
         method: 'POST',
@@ -201,8 +408,8 @@ const ManageGamePage = () => {
         const data = await response.json();
         
         if (data.success) {
-          await fetchGameProfiles();
-          await fetchStats();
+          console.log('Game ID saved successfully:', data);
+          await broadcastUpdates(); // Request updates after successful save
           handleCloseModal();
         } else {
           throw new Error(data.message || 'Failed to assign Game ID');
@@ -221,6 +428,7 @@ const ManageGamePage = () => {
   const handleApproveCredit = async (row) => {
     try {
       setSubmitting(true);
+      console.log('Approving credit for:', row);
       
       const response = await fetch('http://localhost:5000/api/admin/games/approve-credit', {
         method: 'POST',
@@ -238,8 +446,8 @@ const ManageGamePage = () => {
         const data = await response.json();
         
         if (data.success) {
-          await fetchGameProfiles();
-          await fetchStats();
+          console.log('Credit approved successfully:', data);
+          await broadcastUpdates(); // Request updates after successful approval
         } else {
           throw new Error(data.message || 'Failed to approve credit');
         }
@@ -261,6 +469,7 @@ const ManageGamePage = () => {
     
     try {
       setSubmitting(true);
+      console.log('Disapproving credit for:', row);
       
       const response = await fetch('http://localhost:5000/api/admin/games/disapprove-credit', {
         method: 'POST',
@@ -278,8 +487,8 @@ const ManageGamePage = () => {
         const data = await response.json();
         
         if (data.success) {
-          await fetchGameProfiles();
-          await fetchStats();
+          console.log('Credit disapproved successfully:', data);
+          await broadcastUpdates(); // Request updates after successful disapproval
         } else {
           throw new Error(data.message || 'Failed to disapprove credit');
         }
@@ -297,6 +506,7 @@ const ManageGamePage = () => {
   const handleApproveRedeem = async (row) => {
     try {
       setSubmitting(true);
+      console.log('Approving redeem for:', row);
       
       const response = await fetch('http://localhost:5000/api/admin/games/approve-redeem', {
         method: 'POST',
@@ -314,8 +524,8 @@ const ManageGamePage = () => {
         const data = await response.json();
         
         if (data.success) {
-          await fetchGameProfiles();
-          await fetchStats();
+          console.log('Redeem approved successfully:', data);
+          await broadcastUpdates(); // Request updates after successful approval
         } else {
           throw new Error(data.message || 'Failed to approve redeem');
         }
@@ -337,6 +547,7 @@ const ManageGamePage = () => {
     
     try {
       setSubmitting(true);
+      console.log('Disapproving redeem for:', row);
       
       const response = await fetch('http://localhost:5000/api/admin/games/disapprove-redeem', {
         method: 'POST',
@@ -354,8 +565,8 @@ const ManageGamePage = () => {
         const data = await response.json();
         
         if (data.success) {
-          await fetchGameProfiles();
-          await fetchStats();
+          console.log('Redeem disapproved successfully:', data);
+          await broadcastUpdates(); // Request updates after successful disapproval
         } else {
           throw new Error(data.message || 'Failed to disapprove redeem');
         }
@@ -406,14 +617,36 @@ const ManageGamePage = () => {
       </span>
     );
   };
-
   return (
     <div className="px-6 py-6 max-w-full">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-900">Game Management</h1>
-        <p className="mt-1 text-gray-600">Manage game profiles and handle credit/redeem requests</p>
+      {/* Notification Badge */}
+      {newNotification && (
+        <div 
+          className="fixed top-4 right-4 bg-red-500 text-white px-4 py-2 rounded-lg shadow-lg animate-pulse z-50 cursor-pointer"
+          onClick={() => setNewNotification(false)}
+        >
+          <div className="flex items-center">
+            <svg className="w-6 h-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+            </svg>
+            <span>New game profile updates</span>
+          </div>
+        </div>
+      )}
+  
+      <div className="mb-8 flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Game Management</h1>
+          <p className="mt-1 text-gray-600">Manage game profiles and handle credit/redeem requests</p>
+        </div>
+        {socketConnected && (
+          <span className="text-xs text-green-600 flex items-center">
+            <span className="h-2 w-2 bg-green-500 rounded-full mr-1"></span>
+            Live Updates
+          </span>
+        )}
       </div>
-
+  
       {/* Stats Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
@@ -429,7 +662,7 @@ const ManageGamePage = () => {
             </div>
           </div>
         </div>
-
+  
         <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
           <div className="flex items-center">
             <div className="flex-shrink-0 bg-yellow-500 rounded-md p-3">
@@ -443,7 +676,7 @@ const ManageGamePage = () => {
             </div>
           </div>
         </div>
-
+  
         <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
           <div className="flex items-center">
             <div className="flex-shrink-0 bg-blue-500 rounded-md p-3">
@@ -457,7 +690,7 @@ const ManageGamePage = () => {
             </div>
           </div>
         </div>
-
+  
         <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
           <div className="flex items-center">
             <div className="flex-shrink-0 bg-purple-500 rounded-md p-3">
@@ -472,14 +705,17 @@ const ManageGamePage = () => {
           </div>
         </div>
       </div>
-
+  
       {/* Filters and tabs */}
       <div className="mb-6">
         <div className="sm:flex sm:items-center sm:justify-between">
           <div className="flex-1">
             <div className="flex space-x-1 rounded-lg bg-gray-100 p-1">
               <button
-                onClick={() => setActiveTab('all')}
+                onClick={() => {
+                  setActiveTab('all');
+                  setNewNotification(false);
+                }}
                 className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
                   activeTab === 'all' 
                     ? 'bg-white text-gray-900 shadow-sm' 
@@ -489,7 +725,10 @@ const ManageGamePage = () => {
                 All Profiles
               </button>
               <button
-                onClick={() => setActiveTab('pending')}
+                onClick={() => {
+                  setActiveTab('pending');
+                  setNewNotification(false);
+                }}
                 className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
                   activeTab === 'pending' 
                     ? 'bg-white text-gray-900 shadow-sm' 
@@ -499,7 +738,10 @@ const ManageGamePage = () => {
                 Pending Profiles {statsData.pendingProfiles > 0 && `(${statsData.pendingProfiles})`}
               </button>
               <button
-                onClick={() => setActiveTab('credit')}
+                onClick={() => {
+                  setActiveTab('credit');
+                  setNewNotification(false);
+                }}
                 className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
                   activeTab === 'credit' 
                     ? 'bg-white text-gray-900 shadow-sm' 
@@ -509,7 +751,10 @@ const ManageGamePage = () => {
                 Credit Requests {statsData.pendingCredits > 0 && `(${statsData.pendingCredits})`}
               </button>
               <button
-                onClick={() => setActiveTab('redeem')}
+                onClick={() => {
+                  setActiveTab('redeem');
+                  setNewNotification(false);
+                }}
                 className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
                   activeTab === 'redeem' 
                     ? 'bg-white text-gray-900 shadow-sm' 
@@ -538,22 +783,29 @@ const ManageGamePage = () => {
               </div>
               <button
                 onClick={() => {
-                  fetchGameProfiles();
-                  fetchStats();
+                  setNewNotification(false);
+                  broadcastUpdates();
                 }}
-                disabled={submitting}
+                disabled={submitting || loading}
                 className="inline-flex items-center rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
               >
-                <svg className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Refresh
+                {loading ? (
+                  <svg className="animate-spin h-4 w-4 mr-1" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <svg className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                )}
+                {loading ? 'Loading...' : 'Refresh'}
               </button>
             </div>
           </div>
         </div>
       </div>
-
+  
       {/* Error display */}
       {error && (
         <div className="rounded-md bg-red-50 p-4 mb-6">
@@ -582,250 +834,253 @@ const ManageGamePage = () => {
           </div>
         </div>
       )}
-
+  
       {/* Game Profiles Table */}
-{loading ? (
-  <div className="flex flex-col items-center justify-center h-64">
-    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-    <p className="mt-3 text-sm text-gray-500">Loading game profiles...</p>
-  </div>
-) : (
-  <>
-    <div className="overflow-x-auto bg-white shadow-sm ring-1 ring-gray-200 sm:rounded-lg">
-      {getProfileRows().length > 0 ? (
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr>
-              <th scope="col" className="py-3.5 pl-4 pr-3 text-left text-sm font-semibold text-gray-900 sm:pl-6">User</th>
-              <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game</th>
-              <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game ID</th>
-              <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Status</th>
-              <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
-                Credit Amount
-              </th>
-              <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
-                Requested
-              </th>
-              <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">Date</th>
-              <th scope="col" className="relative py-3.5 pl-3 pr-4 sm:pr-6">
-                <span className="sr-only">Actions</span>
-              </th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-200 bg-white">
-            {paginatedRows().map((row, index) => (
-              <tr key={`${row.userId}-${row.gameName}-${index}`}>
-                <td className="whitespace-nowrap py-4 pl-4 pr-3 text-sm sm:pl-6">
-                  <div className="flex items-center">
-                    <div className="h-10 w-10 flex-shrink-0 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
-                      <span className="text-xs font-medium text-white">
-                        {row.username.charAt(0).toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="ml-4">
-                      <div className="font-medium text-gray-900">{row.username}</div>
-                      <div className="text-gray-500">{row.email}</div>
-                    </div>
-                  </div>
-                </td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-900">{row.gameName}</td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-700">
-                  {row.gameId === 'Not assigned' ? (
-                    <span className="text-gray-400 italic">Not assigned</span>
-                  ) : (
-                    row.gameId
-                  )}
-                </td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm">
-                  <StatusTag status={row.profileStatus} type="profile" />
-                  {row.creditStatus !== 'none' && (
-                    <span className="ml-2">
-                      <StatusTag status={row.creditStatus} type="credit" />
-                    </span>
-                  )}
-                </td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-900">
-                  ${row.creditAmount.toFixed(2)}
-                </td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm text-right">
-                  {row.requestedAmount > 0 ? (
-                    <span className="font-medium text-gray-900">
-                      ${row.requestedAmount.toFixed(2)}
-                    </span>
-                  ) : (
-                    <span className="text-gray-400">-</span>
-                  )}
-                </td>
-                <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-500">
-                  {row.createdAt}
-                </td>
-                <td className="whitespace-nowrap py-4 pl-3 pr-4 text-right text-sm font-medium sm:pr-6">
-                  {row.profileStatus === 'pending' && (
-                    <button
-                      type="button"
-                      onClick={() => handleEditClick(row)}
-                      className="text-indigo-600 hover:text-indigo-900 mr-3"
-                      disabled={submitting}
-                    >
-                      Assign ID
-                    </button>
-                  )}
-                  
-                  {row.creditStatus === 'pending' && (
-                    <div className="flex space-x-2 justify-end">
-                      <button
-                        type="button"
-                        onClick={() => handleApproveCredit(row)}
-                        className="text-green-600 hover:text-green-900"
-                        disabled={submitting}
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDisapproveCredit(row)}
-                        className="text-red-600 hover:text-red-900"
-                        disabled={submitting}
-                      >
-                        Decline
-                      </button>
-                    </div>
-                  )}
-                  
-                  {row.creditStatus === 'pending_redeem' && (
-                    <div className="flex space-x-2 justify-end">
-                      <button
-                        type="button"
-                        onClick={() => handleApproveRedeem(row)}
-                        className="text-green-600 hover:text-green-900"
-                        disabled={submitting}
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDisapproveRedeem(row)}
-                        className="text-red-600 hover:text-red-900"
-                        disabled={submitting}
-                      >
-                        Decline
-                      </button>
-                    </div>
-                  )}
-                  
-                  {row.profileStatus === 'active' && row.creditStatus === 'none' && (
-                    <button
-                      type="button"
-                      onClick={() => handleEditClick(row)}
-                      className="text-indigo-600 hover:text-indigo-900"
-                      disabled={submitting}
-                    >
-                      Edit ID
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {loading ? (
+        <div className="flex flex-col items-center justify-center h-64">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
+          <p className="mt-3 text-sm text-gray-500">Loading game profiles...</p>
+        </div>
       ) : (
-        <div className="py-16 text-center">
-          <svg
-            className="mx-auto h-12 w-12 text-gray-400"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            aria-hidden="true"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="2"
-              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-            />
-          </svg>
-          <h3 className="mt-2 text-sm font-medium text-gray-900">No game profiles</h3>
-          <p className="mt-1 text-sm text-gray-500">
-            No game profiles found matching your criteria.
-          </p>
-        </div>
-      )}
-    </div>
-
-    {/* Pagination */}
-    {getProfileRows().length > 0 && (
-      <div className="flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6 mt-4 rounded-md">
-        <div className="flex flex-1 justify-between sm:hidden">
-          <button
-            onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-            disabled={currentPage === 1}
-            className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          >
-            Previous
-          </button>
-          <button
-            onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-            disabled={currentPage === totalPages}
-            className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          >
-            Next
-          </button>
-        </div>
-        <div className="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
-          <div>
-            <p className="text-sm text-gray-700">
-              Showing <span className="font-medium">{Math.min((currentPage - 1) * itemsPerPage + 1, getProfileRows().length)}</span> to{' '}
-              <span className="font-medium">{Math.min(currentPage * itemsPerPage, getProfileRows().length)}</span> of{' '}
-              <span className="font-medium">{getProfileRows().length}</span> results
-            </p>
-          </div>
-          <div>
-            <nav className="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
-              <button
-                onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-                disabled={currentPage === 1}
-                className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-              >
-                <span className="sr-only">Previous</span>
-                <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                  <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 01-.02 1.06L8.832 10l3.938 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clipRule="evenodd" />
-                </svg>
-              </button>
-              
-              {/* Page numbers */}
-              {[...Array(totalPages)].map((_, i) => (
-                <button
-                  key={i}
-                  onClick={() => setCurrentPage(i + 1)}
-                  className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${
-                    currentPage === i + 1
-                      ? 'z-10 bg-indigo-600 text-white focus:z-20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600'
-                      : 'text-gray-900 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0'
-                  }`}
+        <>
+          <div className="overflow-x-auto bg-white shadow-sm ring-1 ring-gray-200 sm:rounded-lg">
+            {getProfileRows().length > 0 ? (
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th scope="col" className="py-3.5 pl-4 pr-3 text-left text-sm font-semibold text-gray-900 sm:pl-6">User</th>
+                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game</th>
+                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game ID</th>
+                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Status</th>
+                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
+                      Credit Amount
+                    </th>
+                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
+                      Requested
+                    </th>
+                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">Date</th>
+                    <th scope="col" className="relative py-3.5 pl-3 pr-4 sm:pr-6">
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200 bg-white">
+                  {paginatedRows().map((row, index) => (
+                    <tr key={`${row.userId}-${row.gameName}-${index}`}>
+                      <td className="whitespace-nowrap py-4 pl-4 pr-3 text-sm sm:pl-6">
+                        <div className="flex items-center">
+                          <div className="h-10 w-10 flex-shrink-0 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
+                            <span className="text-xs font-medium text-white">
+                              {row.username.charAt(0).toUpperCase()}
+                            </span>
+                          </div>
+                          <div className="ml-4">
+                            <div className="font-medium text-gray-900">{row.username}</div>
+                            <div className="text-gray-500">{row.email}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-900">{row.gameName}</td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-700">
+                        {row.gameId === 'Not assigned' ? (
+                          <span className="text-gray-400 italic">Not assigned</span>
+                        ) : (
+                          row.gameId
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm">
+                        <StatusTag status={row.profileStatus} type="profile" />
+                        {row.creditStatus !== 'none' && (
+                          <span className="ml-2">
+                            <StatusTag status={row.creditStatus} type="credit" />
+                          </span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-900">
+                        ${row.creditAmount.toFixed(2)}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right">
+                        {row.requestedAmount > 0 ? (
+                          <span className="font-medium text-gray-900">
+                            ${row.requestedAmount.toFixed(2)}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-500">
+                        {row.createdAt}
+                      </td>
+                      <td className="whitespace-nowrap py-4 pl-3 pr-4 text-right text-sm font-medium sm:pr-6">
+                        {row.profileStatus === 'pending' && (
+                          <button
+                            type="button"
+                            onClick={() => handleEditClick(row)}
+                            className="text-indigo-600 hover:text-indigo-900 mr-3"
+                            disabled={submitting}
+                          >
+                            Assign ID
+                          </button>
+                        )}
+                        
+                        {row.creditStatus === 'pending' && (
+                          <div className="flex space-x-2 justify-end">
+                            <button
+                              type="button"
+                              onClick={() => handleApproveCredit(row)}
+                              className="text-green-600 hover:text-green-900"
+                              disabled={submitting}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDisapproveCredit(row)}
+                              className="text-red-600 hover:text-red-900"
+                              disabled={submitting}
+                            >
+                              Decline
+                            </button>
+                          </div>
+                        )}
+                        
+                        {row.creditStatus === 'pending_redeem' && (
+                          <div className="flex space-x-2 justify-end">
+                            <button
+                              type="button"
+                              onClick={() => handleApproveRedeem(row)}
+                              className="text-green-600 hover:text-green-900"
+                              disabled={submitting}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDisapproveRedeem(row)}
+                              className="text-red-600 hover:text-red-900"
+                              disabled={submitting}
+                            >
+                              Decline
+                            </button>
+                          </div>
+                        )}
+                        
+                        {row.profileStatus === 'active' && row.creditStatus === 'none' && (
+                          <button
+                            type="button"
+                            onClick={() => handleEditClick(row)}
+                            className="text-indigo-600 hover:text-indigo-900"
+                            disabled={submitting}
+                          >
+                            Edit ID
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="py-16 text-center">
+                <svg
+                  className="mx-auto h-12 w-12 text-gray-400"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  aria-hidden="true"
                 >
-                  {i + 1}
-                </button>
-              ))}
-              
-              <button
-                onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-                disabled={currentPage === totalPages}
-                className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-              >
-                <span className="sr-only">Next</span>
-                <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                  <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                  />
                 </svg>
-              </button>
-            </nav>
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No game profiles</h3>
+                <p className="mt-1 text-sm text-gray-500">
+                  No game profiles found matching your criteria.
+                </p>
+              </div>
+            )}
           </div>
-        </div>
-      </div>
-    )}
-  </>
-)}
-
-{/* Game ID Assignment Modal */}
+  
+          {/* Pagination */}
+          {getProfileRows().length > 0 && (
+            <div className="flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6 mt-4 rounded-md">
+              <div className="flex flex-1 justify-between sm:hidden">
+                <button
+                  onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                  disabled={currentPage === 1}
+                  className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                  disabled={currentPage === totalPages}
+                  className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  Next
+                </button>
+              </div>
+              <div className="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm text-gray-700">
+                    Showing <span className="font-medium">{Math.min((currentPage - 1) * itemsPerPage + 1, getProfileRows().length)}</span> to{' '}
+                    <span className="font-medium">{Math.min(currentPage * itemsPerPage, getProfileRows().length)}</span> of{' '}
+                    <span className="font-medium">{getProfileRows().length}</span> results
+                  </p>
+                </div>
+                <div>
+                  <nav className="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
+                    <button
+                      onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                      disabled={currentPage === 1}
+                      className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
+                    >
+                      <span className="sr-only">Previous</span>
+                      <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                        <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 01-.02 1.06L8.832 10l3.938 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                    
+                    {/* Page numbers */}
+                    {[...Array(totalPages)].map((_, i) => (
+                      <button
+                        key={i}
+                        onClick={() => setCurrentPage(i + 1)}
+                        className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${
+                          currentPage === i + 1
+                            ? 'z-10 bg-indigo-600 text-white focus:z-20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600'
+                            : 'text-gray-900 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0'
+                        }`}
+                      >
+                        {i + 1}
+                      </button>
+                    ))}
+                    
+                    <button
+                      onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                      disabled={currentPage === totalPages}
+                      className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
+                    >
+                      <span className="sr-only">Next</span>
+                      <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                        <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                  </nav>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+  
+      {/* Game ID Assignment Modal */}
+      
+  
+        {/* Game ID Assignment Modal */}
 {showModal && (
   <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50">
     <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
@@ -846,37 +1101,37 @@ const ManageGamePage = () => {
       </div>
       
       <div className="mt-2">
-  <div className="mb-4">
-    <div className="px-5 py-4 bg-gray-50 rounded-lg border border-gray-200 shadow-sm">
-      <div className="flex items-center text-sm">
-        <span className="font-semibold text-gray-600 w-24">Username:</span>
-        <span className="ml-2 text-gray-900 font-medium">{editingProfile.username}</span>
+        <div className="mb-4">
+          <div className="px-5 py-4 bg-gray-50 rounded-lg border border-gray-200 shadow-sm">
+            <div className="flex items-center text-sm">
+              <span className="font-semibold text-gray-600 w-24">Username:</span>
+              <span className="ml-2 text-gray-900 font-medium">{editingProfile.username}</span>
+            </div>
+            <div className="mt-2 flex items-center text-sm">
+              <span className="font-semibold text-gray-600 w-24">Game:</span>
+              <span className="ml-2 text-gray-900 font-medium">{editingProfile.gameName}</span>
+            </div>
+          </div>
+        </div>
+        
+        <div className="mb-5">
+          <label htmlFor="gameId" className="block text-sm font-medium text-gray-700 mb-2">
+            Game ID
+          </label>
+          <div className="relative rounded-md shadow-sm">
+            <input
+              type="text"
+              name="gameId"
+              id="gameId"
+              className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+              placeholder="Enter game ID"
+              value={gameIdInput}
+              onChange={(e) => setGameIdInput(e.target.value)}
+              autoFocus
+            />
+          </div>
+        </div>
       </div>
-      <div className="mt-2 flex items-center text-sm">
-        <span className="font-semibold text-gray-600 w-24">Game:</span>
-        <span className="ml-2 text-gray-900 font-medium">{editingProfile.gameName}</span>
-      </div>
-    </div>
-  </div>
-  
-  <div className="mb-5">
-    <label htmlFor="gameId" className="block text-sm font-medium text-gray-700 mb-2">
-      Game ID
-    </label>
-    <div className="relative rounded-md shadow-sm">
-      <input
-        type="text"
-        name="gameId"
-        id="gameId"
-        className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-        placeholder="Enter game ID"
-        value={gameIdInput}
-        onChange={(e) => setGameIdInput(e.target.value)}
-        autoFocus
-      />
-    </div>
-  </div>
-</div>
       
       <div className="mt-5 flex justify-end gap-3">
         <button
