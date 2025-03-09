@@ -1,5 +1,5 @@
 // Configuration for the API
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'https://ad.bigwin.gold/api';
 
 // Token management
 const getToken = () => {

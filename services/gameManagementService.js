@@ -2,7 +2,7 @@
 import { io } from 'socket.io-client';
 import notificationSound from '../src/assets/notification-sound.mp3';
 
-const API_BASE_URL = 'http://localhost:5000';
+const API_BASE_URL = import.meta.env.VITE_BASE_URL || 'http://localhost:5000';
 const API_ENDPOINT = `${API_BASE_URL}/api/admin/games`;
 
 // Socket instance that will be reused
