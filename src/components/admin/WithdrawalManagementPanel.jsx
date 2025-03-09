@@ -1,7 +1,21 @@
+// src/components/WithdrawalManagementPanel.jsx
 import React, { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
-import { io } from 'socket.io-client';
-import notificationSound from '../../assets/notification-sound.mp3';
+import {
+  initializeSocket,
+  disconnectSocket,
+  requestPendingWithdrawals,
+  isSocketConnected,
+  fetchPendingWithdrawals,
+  approveWithdrawal,
+  disapproveWithdrawal,
+  playNotificationSound,
+  showBrowserNotification,
+  requestNotificationPermission,
+  formatDate,
+  getNetworkLabel,
+  copyToClipboard
+} from '../../../services/withdrawlManagementService';
 
 const WithdrawalManagementPanel = () => {
   const [withdrawals, setWithdrawals] = useState([]);
@@ -20,9 +34,6 @@ const WithdrawalManagementPanel = () => {
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const [confirmAction, setConfirmAction] = useState(null);
   
-  // WebSocket connection state
-  const socketRef = useRef(null);
-  
   // Notification state
   const [newNotification, setNewNotification] = useState(false);
   const [notificationCount, setNotificationCount] = useState(0);
@@ -33,49 +44,19 @@ const WithdrawalManagementPanel = () => {
     // Fetch data initially using REST API to ensure we have data
     fetchPendingWithdrawalsFallback();
     
-    // Create socket connection
-    const socket = io('http://localhost:5000', {
-      transports: ['websocket'],
-      autoConnect: true
-    });
-    
-    socketRef.current = socket;
-    
     // Socket event handlers
-    socket.on('connect', () => {
-      console.log('Connected to WebSocket server');
-      
-      // Authenticate with JWT token from localStorage
-      const token = localStorage.getItem('accessToken');
-      
-      if (!token) {
-        console.error('No authentication token found in localStorage');
-        setError('Authentication token not found');
-        return;
-      }
-      
-      console.log('Authenticating socket with token');
-      socket.emit('authenticate', token);
-    });
+    const onAuthSuccess = (response) => {
+      console.log('Socket authenticated successfully');
+    };
     
-    socket.on('disconnect', () => {
-      console.log('Disconnected from WebSocket server');
-    });
+    const onAuthFailure = (message) => {
+      console.error('Socket authentication failed:', message);
+      setError('WebSocket authentication failed: ' + message);
+      // Fall back to REST API
+      fetchPendingWithdrawalsFallback();
+    };
     
-    socket.on('authenticated', (response) => {
-      console.log('Socket authentication response:', response);
-      if (response.success) {
-        console.log('Socket authenticated successfully');
-      } else {
-        console.error('Socket authentication failed:', response.message);
-        setError('WebSocket authentication failed: ' + response.message);
-        // Fall back to REST API
-        fetchPendingWithdrawalsFallback();
-      }
-    });
-    
-    socket.on('pendingWithdrawals', (data) => {
-      console.log('Received pending withdrawals via WebSocket:', data);
+    const onWithdrawalsReceived = (data) => {
       if (data.success) {
         // Check if this is an update with new withdrawals
         const currentCount = withdrawals.length;
@@ -87,21 +68,12 @@ const WithdrawalManagementPanel = () => {
           setNotificationCount(additionalCount);
           setNewNotification(true);
           
-          // Play notification sound if available
-          try {
-            const audio = new Audio(notificationSound);
-            audio.play().catch(err => console.log('Unable to play notification sound', err));
-          } catch (err) {
-            console.log('Error playing notification sound:', err);
-          }
-          
-          // Show browser notification if permitted
-          if ("Notification" in window && Notification.permission === 'granted') {
-            new Notification('New Withdrawal Requests', {
-              body: `${additionalCount} new withdrawal request${additionalCount > 1 ? 's' : ''} pending`,
-              icon: '/favicon.ico'
-            });
-          }
+          // Play notification sound and show browser notification
+          playNotificationSound();
+          showBrowserNotification(
+            'New Withdrawal Requests', 
+            `${additionalCount} new withdrawal request${additionalCount > 1 ? 's' : ''} pending`
+          );
         }
         
         // Update state with new withdrawals
@@ -111,17 +83,32 @@ const WithdrawalManagementPanel = () => {
         setError(data.message || 'Failed to fetch pending withdrawals');
       }
       setLoading(false);
-    });
+    };
     
-    socket.on('error', (error) => {
+    const onError = (error) => {
       console.error('Socket error:', error);
       setError(error.message || 'WebSocket error occurred');
       setLoading(false);
-    });
+    };
+    
+    // Initialize socket with event handlers
+    initializeSocket(
+      onAuthSuccess, 
+      onAuthFailure, 
+      onWithdrawalsReceived,
+      onError
+    );
+    
+    // Request browser notification permission on component mount
+    if ("Notification" in window && 
+        Notification.permission !== 'granted' && 
+        Notification.permission !== 'denied') {
+      requestNotificationPermission();
+    }
     
     // Clean up socket connection when component unmounts
     return () => {
-      socket.disconnect();
+      disconnectSocket();
     };
   }, []);
 
@@ -138,15 +125,6 @@ const WithdrawalManagementPanel = () => {
     // Update the reference for next comparison
     previousWithdrawalsCountRef.current = withdrawals.length;
   }, [withdrawals.length]);
-
-  // Request browser notification permission on component mount
-  useEffect(() => {
-    if ("Notification" in window && 
-        Notification.permission !== 'granted' && 
-        Notification.permission !== 'denied') {
-      Notification.requestPermission();
-    }
-  }, []);
   
   // Function to show alert
   const showCustomAlert = (message, type = 'success') => {
@@ -166,21 +144,18 @@ const WithdrawalManagementPanel = () => {
   };
 
   // Request browser notification permission
-  const requestNotificationPermission = async () => {
-    if (!("Notification" in window)) {
+  const handleRequestNotificationPermission = async () => {
+    const permission = await requestNotificationPermission();
+    
+    if (permission === 'not-supported') {
       showCustomAlert("This browser does not support desktop notifications", "warning");
       return;
     }
     
-    if (Notification.permission !== "granted") {
-      const permission = await Notification.requestPermission();
-      if (permission === "granted") {
-        showCustomAlert("Notifications enabled!", "success");
-      } else {
-        showCustomAlert("Notification permission denied", "info");
-      }
+    if (permission === "granted") {
+      showCustomAlert("Notifications enabled!", "success");
     } else {
-      showCustomAlert("Notifications are already enabled", "info");
+      showCustomAlert("Notification permission denied", "info");
     }
   };
   
@@ -188,25 +163,8 @@ const WithdrawalManagementPanel = () => {
   const fetchPendingWithdrawalsFallback = async () => {
     try {
       setLoading(true);
-      const response = await fetch('http://localhost:5000/api/admin/withdrawals/pending', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch pending withdrawals');
-      }
-      
-      const data = await response.json();
-      
-      if (data.success) {
-        console.log("Pending withdrawals (REST fallback):", data.pendingWithdrawals);
-        setWithdrawals(data.pendingWithdrawals || []);
-      } else {
-        throw new Error(data.message || 'Failed to fetch pending withdrawals');
-      }
-      
+      const data = await fetchPendingWithdrawals();
+      setWithdrawals(data);
       setError(null);
     } catch (err) {
       setError(err.message);
@@ -217,12 +175,12 @@ const WithdrawalManagementPanel = () => {
   };
   
   // Refresh data on demand - use WebSocket if connected, otherwise fallback to REST
-  const fetchPendingWithdrawals = () => {
+  const handleFetchPendingWithdrawals = () => {
     clearNotifications(); // Clear notifications when manually refreshing
     
-    if (socketRef.current && socketRef.current.connected) {
+    if (isSocketConnected()) {
       setLoading(true);
-      socketRef.current.emit('get:pendingWithdrawals');
+      requestPendingWithdrawals();
     } else {
       fetchPendingWithdrawalsFallback();
     }
@@ -240,7 +198,7 @@ const WithdrawalManagementPanel = () => {
   };
 
   const handleCopyAddress = (address) => {
-    navigator.clipboard.writeText(address)
+    copyToClipboard(address)
       .then(() => {
         showCustomAlert('Address copied to clipboard!', 'success');
       })
@@ -254,34 +212,12 @@ const WithdrawalManagementPanel = () => {
     if (!activeWithdrawal) return;
     
     try {
-      const response = await fetch('http://localhost:5000/api/admin/withdrawals/approve', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: activeWithdrawal.userId,
-          withdrawalId: activeWithdrawal.withdrawalId,
-          txHash: txHash.trim() || null
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to approve withdrawal');
-      }
-      
-      const data = await response.json();
-      
-      if (data.success) {
-        // Remove the approved withdrawal from the list
-        setWithdrawals(withdrawals.filter(w => w.withdrawalId !== activeWithdrawal.withdrawalId));
-        setShowTxModal(false);
-        setActiveWithdrawal(null);
-        showCustomAlert('Withdrawal successfully approved!', 'success');
-      } else {
-        throw new Error(data.message || 'Failed to approve withdrawal');
-      }
+      await approveWithdrawal(activeWithdrawal, txHash);
+      // Remove the approved withdrawal from the list
+      setWithdrawals(withdrawals.filter(w => w.withdrawalId !== activeWithdrawal.withdrawalId));
+      setShowTxModal(false);
+      setActiveWithdrawal(null);
+      showCustomAlert('Withdrawal successfully approved!', 'success');
     } catch (err) {
       setError(err.message);
       showCustomAlert(err.message, 'error');
@@ -296,58 +232,15 @@ const WithdrawalManagementPanel = () => {
   
   const performDisapproveWithdrawal = async (withdrawal) => {
     try {
-      const response = await fetch('http://localhost:5000/api/admin/withdrawals/disapprove', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: withdrawal.userId,
-          withdrawalId: withdrawal.withdrawalId
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to reject withdrawal');
-      }
-      
-      const data = await response.json();
-      
-      if (data.success) {
-        // Remove the rejected withdrawal from the list
-        setWithdrawals(withdrawals.filter(w => w.withdrawalId !== withdrawal.withdrawalId));
-        showCustomAlert('Withdrawal successfully rejected', 'info');
-      } else {
-        throw new Error(data.message || 'Failed to reject withdrawal');
-      }
+      await disapproveWithdrawal(withdrawal);
+      // Remove the rejected withdrawal from the list
+      setWithdrawals(withdrawals.filter(w => w.withdrawalId !== withdrawal.withdrawalId));
+      showCustomAlert('Withdrawal successfully rejected', 'info');
     } catch (err) {
       setError(err.message);
       showCustomAlert(err.message, 'error');
       console.error('Error rejecting withdrawal:', err);
     }
-  };
-  
-  // Format date to local format
-  const formatDate = (dateString) => {
-    const options = { 
-      year: 'numeric', 
-      month: 'short', 
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    };
-    return new Date(dateString).toLocaleDateString(undefined, options);
-  };
-  
-  // Get network display label
-  const getNetworkLabel = (asset, network) => {
-    if (asset === 'btc') return 'Bitcoin';
-    if (asset === 'usdt') {
-      if (network === 'trc20') return 'USDT (TRC20)';
-      if (network === 'bep20') return 'USDT (BEP20)';
-    }
-    return `${asset.toUpperCase()} ${network ? `(${network.toUpperCase()})` : ''}`;
   };
   
   if (loading) {
@@ -447,7 +340,7 @@ const WithdrawalManagementPanel = () => {
         <h2 className="text-lg font-medium text-gray-900">Pending Withdrawals</h2>
         <div className="flex">
           <button
-            onClick={requestNotificationPermission}
+            onClick={handleRequestNotificationPermission}
             className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-gray-700 bg-gray-100 hover:bg-gray-200 mr-2"
             title="Notification Settings"
           >
@@ -456,7 +349,7 @@ const WithdrawalManagementPanel = () => {
             </svg>
           </button>
           <button
-            onClick={fetchPendingWithdrawals}
+            onClick={handleFetchPendingWithdrawals}
             className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-indigo-700 bg-indigo-100 hover:bg-indigo-200"
           >
             <svg className="-ml-0.5 mr-1.5 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -560,94 +453,93 @@ const WithdrawalManagementPanel = () => {
         </div>
       )}
       
-     {/* Transaction Hash Modal */}
-{showTxModal && activeWithdrawal && (
-  <div className="fixed inset-0 backdrop-blur-sm bg-gray-600 bg-opacity-30 flex items-center justify-center z-50">
-    <div className="bg-white rounded-lg p-6 w-full max-w-md">
-      <h3 className="text-lg font-medium text-gray-900 mb-4">Approve Withdrawal</h3>
-      <div className="mb-4">
-        <p className="text-sm text-gray-600 mb-1">
-          <span className="font-medium">User:</span> {activeWithdrawal.username}
-        </p>
-        <p className="text-sm text-gray-600 mb-1">
-          <span className="font-medium">Asset:</span> {getNetworkLabel(activeWithdrawal.asset, activeWithdrawal.network)}
-        </p>
-        <p className="text-sm text-gray-600 mb-1">
-          <span className="font-medium">Amount:</span> ${activeWithdrawal.amount.toFixed(2)}
-        </p>
-        <p className="text-sm text-gray-600 mb-1">
-          <span className="font-medium">User's Withdrawal Address:</span>
-        </p>
-        <div className="bg-gray-50 rounded p-2 mb-3 break-all text-xs text-gray-800 flex justify-between items-center">
-          <span className="mr-2">{activeWithdrawal.address || "Address not available"}</span>
-          {activeWithdrawal.address && (
-            <button 
-              onClick={() => handleCopyAddress(activeWithdrawal.address)}
-              className="text-indigo-600 hover:text-indigo-800"
-              title="Copy address"
-            >
-              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-            </button>
-          )}
-        </div>
-        
-        <div className="flex justify-center mb-4">
-          {activeWithdrawal.address && (
-            <div className="p-2 bg-white border border-gray-200 rounded-md">
-              <QRCodeSVG 
-                value={activeWithdrawal.address} 
-                size={128}
-                includeMargin={true}
+      {/* Transaction Hash Modal */}
+      {showTxModal && activeWithdrawal && (
+        <div className="fixed inset-0 backdrop-blur-sm bg-gray-600 bg-opacity-30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">Approve Withdrawal</h3>
+            <div className="mb-4">
+              <p className="text-sm text-gray-600 mb-1">
+                <span className="font-medium">User:</span> {activeWithdrawal.username}
+              </p>
+              <p className="text-sm text-gray-600 mb-1">
+                <span className="font-medium">Asset:</span> {getNetworkLabel(activeWithdrawal.asset, activeWithdrawal.network)}
+              </p>
+              <p className="text-sm text-gray-600 mb-1">
+                <span className="font-medium">Amount:</span> ${activeWithdrawal.amount.toFixed(2)}
+              </p>
+              <p className="text-sm text-gray-600 mb-1">
+                <span className="font-medium">User's Withdrawal Address:</span>
+              </p>
+              <div className="bg-gray-50 rounded p-2 mb-3 break-all text-xs text-gray-800 flex justify-between items-center">
+                <span className="mr-2">{activeWithdrawal.address || "Address not available"}</span>
+                {activeWithdrawal.address && (
+                  <button 
+                    onClick={() => handleCopyAddress(activeWithdrawal.address)}
+                    className="text-indigo-600 hover:text-indigo-800"
+                    title="Copy address"
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+              
+              <div className="flex justify-center mb-4">
+                {activeWithdrawal.address && (
+                  <div className="p-2 bg-white border border-gray-200 rounded-md">
+                    <QRCodeSVG 
+                      value={activeWithdrawal.address} 
+                      size={128}
+                      includeMargin={true}
+                    />
+                  </div>
+                )}
+              </div>
+              
+              <div className="bg-blue-50 rounded p-3 mb-4">
+                <p className="text-sm text-blue-800 font-medium mb-1">Payment Instructions:</p>
+                <p className="text-xs text-blue-700">
+                  Send {activeWithdrawal.amount.toFixed(2)} {activeWithdrawal.asset.toUpperCase()} to the address above using
+                  {activeWithdrawal.network && activeWithdrawal.network !== activeWithdrawal.asset ? 
+                  ` the ${activeWithdrawal.network.toUpperCase()} network` : 
+                  ' the native network'}.
+                </p>
+              </div>
+              
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Transaction Hash (Optional)
+              </label>
+              <input
+                type="text"
+                value={txHash}
+                onChange={(e) => setTxHash(e.target.value)}
+                className="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 rounded-md"
+                placeholder="Enter blockchain transaction hash/ID"
               />
+              <p className="mt-1 text-xs text-gray-500">
+                You can leave this blank if you don't have a transaction hash yet.
+              </p>
             </div>
-          )}
+            
+            <div className="flex justify-end space-x-3">
+              <button
+                onClick={() => setShowTxModal(false)}
+                className="inline-flex justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleApproveWithdrawal}
+                className="inline-flex justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700"
+              >
+                Approve
+              </button>
+            </div>
+          </div>
         </div>
-        
-        <div className="bg-blue-50 rounded p-3 mb-4">
-          <p className="text-sm text-blue-800 font-medium mb-1">Payment Instructions:</p>
-          <p className="text-xs text-blue-700">
-            Send {activeWithdrawal.amount.toFixed(2)} {activeWithdrawal.asset.toUpperCase()} to the address above using
-            {activeWithdrawal.network && activeWithdrawal.network !== activeWithdrawal.asset ? 
-             ` the ${activeWithdrawal.network.toUpperCase()} network` : 
-             ' the native network'}.
-          </p>
-        </div>
-        
-        <label className="block text-sm font-medium text-gray-700 mb-1">
-          Transaction Hash (Optional)
-        </label>
-        <input
-          type="text"
-          value={txHash}
-          onChange={(e) => setTxHash(e.target.value)}
-          className="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 rounded-md"
-          placeholder="Enter blockchain transaction hash/ID"
-        />
-        <p className="mt-1 text-xs text-gray-500">
-          You can leave this blank if you don't have a transaction hash yet.
-        </p>
-      </div>
-      
-      <div className="flex justify-end space-x-3">
-        <button
-          onClick={() => setShowTxModal(false)}
-          className="inline-flex justify-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
-        >
-          Cancel
-        </button>
-        <button
-          onClick={handleApproveWithdrawal}
-          className="inline-flex justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700"
-        >
-          Approve
-        </button>
-      </div>
-    </div>
-  </div>
-)}
-
+      )}
 {/* QR Code Modal */}
 {showQRModal && qrAddress && (
   <div className="fixed inset-0 backdrop-blur-sm bg-gray-600 bg-opacity-30 flex items-center justify-center z-50">

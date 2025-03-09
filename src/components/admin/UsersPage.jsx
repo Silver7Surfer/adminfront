@@ -1,4 +1,6 @@
+// src/components/UsersPage.jsx
 import React, { useState, useEffect } from 'react';
+import { fetchUsers, fetchWallets, deleteUser } from '../../../services/userService';
 
 const UsersPage = () => {
   const [users, setUsers] = useState([]);
@@ -15,37 +17,16 @@ const UsersPage = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      // Fetch users data
-      const usersResponse = await fetch('http://localhost:5000/api/users', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        }
-      });
-      
-      if (!usersResponse.ok) {
-        throw new Error('Failed to fetch users');
-      }
-      
-      const usersData = await usersResponse.json();
+      // Fetch users and wallets data using our service
+      const usersData = await fetchUsers();
       setUsers(usersData);
 
-      // Fetch wallets data
-      const walletsResponse = await fetch('http://localhost:5000/api/wallets', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        }
-      });
-
-      if (walletsResponse.ok) {
-        const walletsData = await walletsResponse.json();
-        
-        // Create a lookup object by userId
-        const walletsMap = {};
-        walletsData.forEach(wallet => {
-          walletsMap[wallet.userId] = wallet;
-        });
-        
+      try {
+        const walletsMap = await fetchWallets();
         setWallets(walletsMap);
+      } catch (walletError) {
+        console.warn('Unable to fetch wallets:', walletError);
+        // Not setting this as a main error since it's not critical
       }
 
       setError(null);
@@ -79,17 +60,7 @@ const UsersPage = () => {
   const handleDeleteUser = async (userId) => {
     if (window.confirm('Are you sure you want to delete this user?')) {
       try {
-        const response = await fetch(`http://localhost:5000/api/users/${userId}`, {
-          method: 'DELETE',
-          headers: {
-            'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-          }
-        });
-        
-        if (!response.ok) {
-          throw new Error('Failed to delete user');
-        }
-        
+        await deleteUser(userId);
         setUsers(users.filter(user => user._id !== userId));
       } catch (error) {
         setError(error.message || 'Failed to delete user');

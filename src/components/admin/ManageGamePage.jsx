@@ -1,6 +1,22 @@
+// src/components/ManageGamePage.jsx
 import React, { useState, useEffect, useRef } from 'react';
-import { io } from 'socket.io-client';
-import notificationSound from '../../assets/notification-sound.mp3'
+import {
+  initializeSocket,
+  disconnectSocket,
+  requestGameProfiles,
+  requestGameStatistics,
+  isSocketConnected,
+  fetchGameProfiles,
+  fetchGameStatistics,
+  assignGameId,
+  approveCredit,
+  disapproveCredit,
+  approveRedeem,
+  disapproveRedeem,
+  playNotificationSound,
+  countPendingItems,
+  formatGameProfiles
+} from '../../../services/gameManagementService';
 
 const ManageGamePage = () => {
   const [gameProfiles, setGameProfiles] = useState([]);
@@ -22,7 +38,6 @@ const ManageGamePage = () => {
   });
   
   // WebSocket connection state
-  const socketRef = useRef(null);
   const [socketConnected, setSocketConnected] = useState(false);
   const [newNotification, setNewNotification] = useState(false);
   
@@ -34,147 +49,77 @@ const ManageGamePage = () => {
     fetchGameProfilesFallback();
     fetchStatsFallback();
     
-    // Create socket connection
-    const socket = io('http://localhost:5000', {
-      transports: ['websocket'],
-      autoConnect: true
-    });
-    
-    socketRef.current = socket;
-    
     // Socket event handlers
-    socket.on('connect', () => {
-      console.log('Connected to WebSocket server');
-      setSocketConnected(true);
-      
-      // Authenticate with JWT token from localStorage
-      const token = localStorage.getItem('accessToken');
-      
-      if (!token) {
-        console.error('No authentication token found in localStorage');
-        setError('Authentication token not found');
-        return;
-      }
-      
-      console.log('Authenticating socket with token');
-      socket.emit('authenticate', token);
-    });
-    
-    socket.on('disconnect', () => {
-      console.log('Disconnected from WebSocket server');
-      setSocketConnected(false);
-    });
-    
-    socket.on('authenticated', (response) => {
-      console.log('Socket authentication response:', response);
-      if (response.success) {
-        console.log('Socket authenticated successfully');
-        // Request initial data
-        socket.emit('get:gameProfiles');
-        socket.emit('get:gameStatistics');
-      } else {
-        console.error('Socket authentication failed:', response.message);
-        setError('WebSocket authentication failed: ' + response.message);
-      }
-    });
-    
-    socket.on('gameProfiles', (data) => {
-      console.log('Received game profiles via WebSocket:', data);
-      if (data.success) {
-        // Check if there are any new pending profiles
-        const previousPendingCount = countPendingItems(gameProfiles);
-        const newPendingCount = countPendingItems(data.profiles || []);
-        
-        if (previousPendingCount < newPendingCount && gameProfiles.length > 0) {
-          setNewNotification(true);
-          // Try to play notification sound
-          try {
-            const audio = new Audio(notificationSound);
-            audio.play().catch(err => console.log('Unable to play notification sound', err));
-          } catch (err) {
-            console.log('Error playing notification sound:', err);
-          }
+    const socketHandlers = {
+      onConnect: () => {
+        setSocketConnected(true);
+      },
+      onDisconnect: () => {
+        setSocketConnected(false);
+      },
+      onAuthenticated: (response) => {
+        if (response.success) {
+          // Request initial data
+          requestGameProfiles();
+          requestGameStatistics();
         }
-        
-        // Log game profiles to debug Edit ID issue
-        console.log('Game profiles data:', JSON.stringify(data.profiles, null, 2));
-        
-        setGameProfiles(data.profiles || []);
-        setLoading(false);
-        setError(null);
-      } else {
-        setError(data.message || 'Failed to fetch game profiles');
+      },
+      onGameProfiles: (data) => {
+        if (data.success) {
+          // Check if there are any new pending profiles
+          const previousPendingCount = countPendingItems(gameProfiles);
+          const newPendingCount = countPendingItems(data.profiles || []);
+          
+          if (previousPendingCount < newPendingCount && gameProfiles.length > 0) {
+            setNewNotification(true);
+            // Play notification sound
+            playNotificationSound();
+          }
+          
+          // Log game profiles to debug Edit ID issue
+          console.log('Game profiles data:', JSON.stringify(data.profiles, null, 2));
+          
+          setGameProfiles(data.profiles || []);
+          setLoading(false);
+          setError(null);
+        } else {
+          setError(data.message || 'Failed to fetch game profiles');
+          setLoading(false);
+        }
+      },
+      onGameStatistics: (data) => {
+        console.log('Received game statistics via WebSocket:', data);
+        playNotificationSound();
+        if (data.success && data.statistics) {
+          setStatsData({
+            totalProfiles: data.statistics.totalProfiles || 0,
+            pendingProfiles: data.statistics.totalPendingProfiles || 0,
+            pendingCredits: data.statistics.pendingCreditRequests || 0,
+            pendingRedeems: data.statistics.pendingRedeemRequests || 0
+          });
+        }
+      },
+      onError: (errorMsg) => {
+        setError(errorMsg || 'WebSocket error occurred');
         setLoading(false);
       }
-    });
+    };
     
-    socket.on('gameStatistics', (data) => {
-      console.log('Received game statistics via WebSocket:', data);
-      const audio = new Audio(notificationSound);
-      audio.play().catch(err => console.log('Unable to play notification sound', err));
-      if (data.success && data.statistics) {
-        setStatsData({
-          totalProfiles: data.statistics.totalProfiles || 0,
-          pendingProfiles: data.statistics.totalPendingProfiles || 0,
-          pendingCredits: data.statistics.pendingCreditRequests || 0,
-          pendingRedeems: data.statistics.pendingRedeemRequests || 0
-        });
-      }
-    });
-    
-    socket.on('error', (error) => {
-      console.error('Socket error:', error);
-      setError(error.message || 'WebSocket error occurred');
-      setLoading(false);
-    });
+    // Initialize socket with event handlers
+    initializeSocket(socketHandlers);
     
     // Clean up socket connection when component unmounts
     return () => {
-      socket.disconnect();
+      disconnectSocket();
     };
   }, []);
-  
-  // Helper function to count pending items
-  const countPendingItems = (profiles) => {
-    let count = 0;
-    profiles.forEach(profile => {
-      if (!profile.games || !Array.isArray(profile.games)) return;
-      
-      profile.games.forEach(game => {
-        if (game.profileStatus === 'pending' || 
-            game.creditAmount?.status === 'pending' || 
-            game.creditAmount?.status === 'pending_redeem') {
-          count++;
-        }
-      });
-    });
-    return count;
-  };
 
   // Fallback functions to use REST API if WebSocket fails
   const fetchGameProfilesFallback = async () => {
     setLoading(true);
     try {
-      console.log('Fetching game profiles using REST API...');
-      const response = await fetch('http://localhost:5000/api/admin/games/profiles', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch game profiles');
-      }
-      
-      const data = await response.json();
-      console.log('REST API game profiles response:', data);
-      
-      if (data.success && data.profiles) {
-        setGameProfiles(data.profiles);
-      } else {
-        setGameProfiles([]);
-      }
-      
+      const profiles = await fetchGameProfiles();
+      setGameProfiles(profiles);
       setError(null);
     } catch (err) {
       setError(err.message || 'Failed to fetch game profiles');
@@ -186,42 +131,23 @@ const ManageGamePage = () => {
 
   const fetchStatsFallback = async () => {
     try {
-      console.log('Fetching game statistics using REST API...');
-      const response = await fetch('http://localhost:5000/api/admin/games/statistics', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch statistics');
-      }
-      
-      const data = await response.json();
-      
-      if (data.success && data.statistics) {
-        setStatsData({
-          totalProfiles: data.statistics.totalProfiles || 0,
-          pendingProfiles: data.statistics.totalPendingProfiles || 0,
-          pendingCredits: data.statistics.pendingCreditRequests || 0,
-          pendingRedeems: data.statistics.pendingRedeemRequests || 0
-        });
-      }
+      const stats = await fetchGameStatistics();
+      setStatsData(stats);
     } catch (err) {
       console.error('Error fetching statistics:', err);
     }
   };
 
   // Refresh data function - use WebSocket if connected, otherwise REST API
-  const fetchGameProfiles = () => {
+  const refreshGameProfiles = () => {
     setNewNotification(false); // Clear notification when manually refreshing
     setLoading(true); // Show loading state
     
     console.log('Manual refresh triggered');
     
-    if (socketRef.current && socketConnected) {
+    if (isSocketConnected()) {
       console.log('Using WebSocket for manual refresh');
-      socketRef.current.emit('get:gameProfiles');
+      requestGameProfiles();
       
       // Add a fallback timer in case the socket request fails or times out
       const fallbackTimer = setTimeout(() => {
@@ -229,19 +155,8 @@ const ManageGamePage = () => {
         fetchGameProfilesFallback();
       }, 3000); // 3 second timeout
       
-      // Clear the fallback timer if we get a response
-      const handleResponse = () => {
-        clearTimeout(fallbackTimer);
-      };
-      
-      socketRef.current.once('gameProfiles', handleResponse);
-      
-      // Remove the event listener if component unmounts before response
       return () => {
         clearTimeout(fallbackTimer);
-        if (socketRef.current) {
-          socketRef.current.off('gameProfiles', handleResponse);
-        }
       };
     } else {
       console.log('Using REST API for manual refresh (no socket connection)');
@@ -249,9 +164,9 @@ const ManageGamePage = () => {
     }
   };
 
-  const fetchStats = () => {
-    if (socketRef.current && socketConnected) {
-      socketRef.current.emit('get:gameStatistics');
+  const refreshStats = () => {
+    if (isSocketConnected()) {
+      requestGameStatistics();
     } else {
       fetchStatsFallback();
     }
@@ -262,10 +177,10 @@ const ManageGamePage = () => {
     setLoading(true);
     console.log('Broadcasting updates after action');
     
-    if (socketRef.current && socketConnected) {
+    if (isSocketConnected()) {
       console.log('Using WebSocket for updates');
-      socketRef.current.emit('get:gameProfiles');
-      socketRef.current.emit('get:gameStatistics');
+      requestGameProfiles();
+      requestGameStatistics();
       
       // Fallback to REST if socket doesn't respond within 3 seconds
       setTimeout(() => {
@@ -284,73 +199,7 @@ const ManageGamePage = () => {
 
   // Function to convert game profiles to table rows
   const getProfileRows = () => {
-    let rows = [];
-    
-    gameProfiles.forEach(profile => {
-      if (!profile.games || !Array.isArray(profile.games)) return;
-      
-      const userId = profile.userId?.toString() || profile._id?.toString();
-      const username = profile.userData?.username || 'Unknown';
-      const email = profile.userData?.email || 'No email';
-      
-      profile.games.forEach(game => {
-        // Make sure gameId is correctly handled
-        const gameId = game.gameId || 'Not assigned';
-        
-        // Log each game to debug Edit ID issue
-        console.log(`Game for ${username}: ${game.gameName}, ID: ${gameId}, Status: ${game.profileStatus}, Credit Status: ${game.creditAmount?.status || 'none'}`);
-        
-        const row = {
-          userId,
-          username,
-          email,
-          gameName: game.gameName,
-          gameId: gameId, // Ensure we use the correct field
-          profileStatus: game.profileStatus,
-          creditAmount: game.creditAmount?.amount || 0,
-          requestedAmount: game.creditAmount?.requestedAmount || 0,
-          creditStatus: game.creditAmount?.status || 'none',
-          createdAt: new Date(profile.createdAt || Date.now()).toLocaleDateString()
-        };
-        
-        // Filter based on active tab
-        if (
-          (activeTab === 'all') ||
-          (activeTab === 'pending' && game.profileStatus === 'pending') ||
-          (activeTab === 'credit' && game.creditAmount?.status === 'pending') ||
-          (activeTab === 'redeem' && game.creditAmount?.status === 'pending_redeem')
-        ) {
-          rows.push(row);
-        }
-      });
-    });
-    
-    // Apply search filter
-    if (searchQuery) {
-      rows = rows.filter(row => 
-        row.username.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        row.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        row.gameName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (row.gameId && row.gameId.toLowerCase().includes(searchQuery.toLowerCase()))
-      );
-    }
-    
-    // Sort by status priority (pending first, then active)
-    rows.sort((a, b) => {
-      // Sort by request status first
-      if (a.creditStatus === 'pending' && b.creditStatus !== 'pending') return -1;
-      if (a.creditStatus !== 'pending' && b.creditStatus === 'pending') return 1;
-      if (a.creditStatus === 'pending_redeem' && b.creditStatus !== 'pending_redeem') return -1;
-      if (a.creditStatus !== 'pending_redeem' && b.creditStatus === 'pending_redeem') return 1;
-      
-      // Then sort by profile status
-      if (a.profileStatus === 'pending' && b.profileStatus !== 'pending') return -1;
-      if (a.profileStatus !== 'pending' && b.profileStatus === 'pending') return 1;
-      
-      return 0;
-    });
-    
-    return rows;
+    return formatGameProfiles(gameProfiles, activeTab, searchQuery);
   };
 
   // Pagination
@@ -391,32 +240,14 @@ const ManageGamePage = () => {
       setSubmitting(true);
       console.log('Saving game ID:', gameIdInput);
       
-      const response = await fetch('http://localhost:5000/api/admin/games/assign-gameid', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: editingProfile.userId,
-          gameName: editingProfile.gameName,
-          gameId: gameIdInput.trim()
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        if (data.success) {
-          console.log('Game ID saved successfully:', data);
-          await broadcastUpdates(); // Request updates after successful save
-          handleCloseModal();
-        } else {
-          throw new Error(data.message || 'Failed to assign Game ID');
-        }
-      } else {
-        throw new Error('Network response was not ok');
-      }
+      await assignGameId(
+        editingProfile.userId, 
+        editingProfile.gameName, 
+        gameIdInput.trim()
+      );
+      
+      await broadcastUpdates(); // Request updates after successful save
+      handleCloseModal();
     } catch (error) {
       console.error('Error assigning game ID:', error);
       setError('Failed to assign Game ID: ' + error.message);
@@ -430,30 +261,8 @@ const ManageGamePage = () => {
       setSubmitting(true);
       console.log('Approving credit for:', row);
       
-      const response = await fetch('http://localhost:5000/api/admin/games/approve-credit', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: row.userId,
-          gameName: row.gameName
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        if (data.success) {
-          console.log('Credit approved successfully:', data);
-          await broadcastUpdates(); // Request updates after successful approval
-        } else {
-          throw new Error(data.message || 'Failed to approve credit');
-        }
-      } else {
-        throw new Error('Network response was not ok');
-      }
+      await approveCredit(row.userId, row.gameName);
+      await broadcastUpdates(); // Request updates after successful approval
     } catch (error) {
       console.error('Error approving credit:', error);
       setError('Failed to approve credit: ' + error.message);
@@ -471,30 +280,8 @@ const ManageGamePage = () => {
       setSubmitting(true);
       console.log('Disapproving credit for:', row);
       
-      const response = await fetch('http://localhost:5000/api/admin/games/disapprove-credit', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: row.userId,
-          gameName: row.gameName
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        if (data.success) {
-          console.log('Credit disapproved successfully:', data);
-          await broadcastUpdates(); // Request updates after successful disapproval
-        } else {
-          throw new Error(data.message || 'Failed to disapprove credit');
-        }
-      } else {
-        throw new Error('Network response was not ok');
-      }
+      await disapproveCredit(row.userId, row.gameName);
+      await broadcastUpdates(); // Request updates after successful disapproval
     } catch (error) {
       console.error('Error disapproving credit:', error);
       setError('Failed to disapprove credit: ' + error.message);
@@ -508,30 +295,8 @@ const ManageGamePage = () => {
       setSubmitting(true);
       console.log('Approving redeem for:', row);
       
-      const response = await fetch('http://localhost:5000/api/admin/games/approve-redeem', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: row.userId,
-          gameName: row.gameName
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        if (data.success) {
-          console.log('Redeem approved successfully:', data);
-          await broadcastUpdates(); // Request updates after successful approval
-        } else {
-          throw new Error(data.message || 'Failed to approve redeem');
-        }
-      } else {
-        throw new Error('Network response was not ok');
-      }
+      await approveRedeem(row.userId, row.gameName);
+      await broadcastUpdates(); // Request updates after successful approval
     } catch (error) {
       console.error('Error approving redeem:', error);
       setError('Failed to approve redeem: ' + error.message);
@@ -549,30 +314,8 @@ const ManageGamePage = () => {
       setSubmitting(true);
       console.log('Disapproving redeem for:', row);
       
-      const response = await fetch('http://localhost:5000/api/admin/games/disapprove-redeem', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`
-        },
-        body: JSON.stringify({
-          userId: row.userId,
-          gameName: row.gameName
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        if (data.success) {
-          console.log('Redeem disapproved successfully:', data);
-          await broadcastUpdates(); // Request updates after successful disapproval
-        } else {
-          throw new Error(data.message || 'Failed to disapprove redeem');
-        }
-      } else {
-        throw new Error('Network response was not ok');
-      }
+      await disapproveRedeem(row.userId, row.gameName);
+      await broadcastUpdates(); // Request updates after successful disapproval
     } catch (error) {
       console.error('Error disapproving redeem:', error);
       setError('Failed to disapprove redeem: ' + error.message);
@@ -1076,83 +819,81 @@ const ManageGamePage = () => {
           )}
         </>
       )}
-  
-      {/* Game ID Assignment Modal */}
       
   
         {/* Game ID Assignment Modal */}
-{showModal && (
-  <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50">
-    <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
-      <div className="flex items-start justify-between mb-5">
-        <h3 className="text-lg font-medium leading-6 text-gray-900">
-          {editingProfile.currentGameId ? 'Edit Game ID' : 'Assign Game ID'}
-        </h3>
-        <button
-          type="button"
-          className="rounded-md bg-white text-gray-400 hover:text-gray-500 focus:outline-none"
-          onClick={handleCloseModal}
-        >
-          <span className="sr-only">Close</span>
-          <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </button>
-      </div>
-      
-      <div className="mt-2">
-        <div className="mb-4">
-          <div className="px-5 py-4 bg-gray-50 rounded-lg border border-gray-200 shadow-sm">
-            <div className="flex items-center text-sm">
-              <span className="font-semibold text-gray-600 w-24">Username:</span>
-              <span className="ml-2 text-gray-900 font-medium">{editingProfile.username}</span>
+      {showModal && (
+        <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+            <div className="flex items-start justify-between mb-5">
+              <h3 className="text-lg font-medium leading-6 text-gray-900">
+                {editingProfile.currentGameId ? 'Edit Game ID' : 'Assign Game ID'}
+              </h3>
+              <button
+                type="button"
+                className="rounded-md bg-white text-gray-400 hover:text-gray-500 focus:outline-none"
+                onClick={handleCloseModal}
+              >
+                <span className="sr-only">Close</span>
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
             </div>
-            <div className="mt-2 flex items-center text-sm">
-              <span className="font-semibold text-gray-600 w-24">Game:</span>
-              <span className="ml-2 text-gray-900 font-medium">{editingProfile.gameName}</span>
+            
+            <div className="mt-2">
+              <div className="mb-4">
+                <div className="px-5 py-4 bg-gray-50 rounded-lg border border-gray-200 shadow-sm">
+                  <div className="flex items-center text-sm">
+                    <span className="font-semibold text-gray-600 w-24">Username:</span>
+                    <span className="ml-2 text-gray-900 font-medium">{editingProfile.username}</span>
+                  </div>
+                  <div className="mt-2 flex items-center text-sm">
+                    <span className="font-semibold text-gray-600 w-24">Game:</span>
+                    <span className="ml-2 text-gray-900 font-medium">{editingProfile.gameName}</span>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="mb-5">
+                <label htmlFor="gameId" className="block text-sm font-medium text-gray-700 mb-2">
+                  Game ID
+                </label>
+                <div className="relative rounded-md shadow-sm">
+                  <input
+                    type="text"
+                    name="gameId"
+                    id="gameId"
+                    className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                    placeholder="Enter game ID"
+                    value={gameIdInput}
+                    onChange={(e) => setGameIdInput(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+              </div>
+            </div>
+            
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                type="button"
+                className="inline-flex justify-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+                onClick={handleCloseModal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="inline-flex justify-center rounded-md border border-transparent bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:ring-offset-2"
+                onClick={handleSaveGameId}
+                disabled={submitting}
+              >
+                {submitting ? 'Saving...' : 'Save'}
+              </button>
             </div>
           </div>
         </div>
-        
-        <div className="mb-5">
-          <label htmlFor="gameId" className="block text-sm font-medium text-gray-700 mb-2">
-            Game ID
-          </label>
-          <div className="relative rounded-md shadow-sm">
-            <input
-              type="text"
-              name="gameId"
-              id="gameId"
-              className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-              placeholder="Enter game ID"
-              value={gameIdInput}
-              onChange={(e) => setGameIdInput(e.target.value)}
-              autoFocus
-            />
-          </div>
-        </div>
-      </div>
-      
-      <div className="mt-5 flex justify-end gap-3">
-        <button
-          type="button"
-          className="inline-flex justify-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
-          onClick={handleCloseModal}
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="inline-flex justify-center rounded-md border border-transparent bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:ring-offset-2"
-          onClick={handleSaveGameId}
-          disabled={submitting}
-        >
-          {submitting ? 'Saving...' : 'Save'}
-        </button>
-      </div>
-    </div>
-  </div>
-)}
+      )}
 
       {/* Show total count */}
       <div className="mt-4 text-sm text-gray-600">
