@@ -27,6 +27,7 @@ const ManageGamePage = () => {
   const [showModal, setShowModal] = useState(false);
   const [editingProfile, setEditingProfile] = useState(null);
   const [gameIdInput, setGameIdInput] = useState('');
+  const [passwordInput, setPasswordInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
@@ -235,15 +236,17 @@ const ManageGamePage = () => {
       setError('Please enter a Game ID');
       return;
     }
-
+  
     try {
       setSubmitting(true);
-      console.log('Saving game ID:', gameIdInput);
+      console.log('Saving game ID and password:', gameIdInput, passwordInput);
       
+      // Send both gameId and password to the backend
       await assignGameId(
         editingProfile.userId, 
         editingProfile.gameName, 
-        gameIdInput.trim()
+        gameIdInput.trim(),
+        passwordInput.trim() // Include password
       );
       
       await broadcastUpdates(); // Request updates after successful save
@@ -872,6 +875,22 @@ const ManageGamePage = () => {
                   />
                 </div>
               </div>
+              <div className="mb-5">
+          <label htmlFor="gamePassword" className="block text-sm font-medium text-gray-700 mb-2">
+            Game Password
+          </label>
+          <div className="relative rounded-md shadow-sm">
+            <input
+              type="text"
+              name="gamePassword"
+              id="gamePassword"
+              className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+              placeholder="Enter game password"
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+            />
+          </div>
+        </div>
             </div>
             
             <div className="mt-5 flex justify-end gap-3">

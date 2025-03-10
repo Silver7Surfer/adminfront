@@ -217,9 +217,9 @@ const fetchGameStatistics = async () => {
  * @param {string} gameId - Game ID to assign
  * @returns {Promise<Object>} Response data
  */
-const assignGameId = async (userId, gameName, gameId) => {
+const assignGameId = async (userId, gameName, gameId, gamePassword = '') => {
   try {
-    console.log('Assigning game ID:', gameId);
+    console.log('Assigning game ID:', gameId, 'and password:', gamePassword);
     
     const response = await fetch(`${API_ENDPOINT}/assign-gameid`, {
       method: 'POST',
@@ -227,7 +227,8 @@ const assignGameId = async (userId, gameName, gameId) => {
       body: JSON.stringify({
         userId,
         gameName,
-        gameId: gameId.trim()
+        gameId: gameId.trim(),
+        gamePassword: gamePassword ? gamePassword.trim() : ''
       })
     });
 
