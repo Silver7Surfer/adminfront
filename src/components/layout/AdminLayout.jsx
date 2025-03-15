@@ -1,13 +1,169 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import {
+  initializeSocket,
+  disconnectSocket,
+  requestGameProfiles,
+  requestGameStatistics,
+  isSocketConnected
+} from '../../../services/gameManagementService';
+import {
+  isNotificationSupported,
+  isServiceWorkerSupported,
+  getNotificationPermission,
+  requestNotificationPermission,
+  registerServiceWorker
+} from '../../../services/PushNotificationService';
 
 const AdminLayout = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
   const [user, setUser] = useState(null);
+  const [notificationCount, setNotificationCount] = useState(0);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [notificationSupported, setNotificationSupported] = useState(false);
+  const [serviceWorkerSupported, setServiceWorkerSupported] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState('default');
+  const [serviceWorkerRegistered, setServiceWorkerRegistered] = useState(false);
+  
   const location = useLocation();
   const navigate = useNavigate();
   const dropdownRef = useRef(null);
+  
+  // Initialize notification system and check permissions
+  useEffect(() => {
+    // Check if notifications are supported
+    const supported = isNotificationSupported();
+    setNotificationSupported(supported);
+    
+    // Check if service worker is supported
+    const swSupported = isServiceWorkerSupported();
+    setServiceWorkerSupported(swSupported);
+    
+    if (supported) {
+      // Get current permission status
+      const permission = getNotificationPermission();
+      setNotificationPermission(permission);
+      
+      // If permission is granted, register service worker for push notifications
+      if (permission === 'granted' && swSupported) {
+        registerServiceWorkerIfNeeded();
+      }
+    }
+    
+    // Listen for messages from service worker
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    }
+    
+    return () => {
+      if (navigator.serviceWorker) {
+        navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+      }
+    };
+  }, []);
+  
+  // Initialize WebSocket connection
+  useEffect(() => {
+    // Socket event handlers
+    const socketHandlers = {
+      onConnect: () => {
+        console.log('WebSocket connected in AdminLayout');
+        setSocketConnected(true);
+      },
+      onDisconnect: () => {
+        console.log('WebSocket disconnected in AdminLayout');
+        setSocketConnected(false);
+      },
+      onAuthenticated: (response) => {
+        console.log('WebSocket authenticated in AdminLayout', response);
+        if (response.success) {
+          // Request initial data
+          requestGameProfiles();
+          requestGameStatistics();
+        }
+      },
+      onGameProfiles: (data) => {
+        console.log('WebSocket game profiles received in AdminLayout');
+        // Just update connection status - actual data handling is in ManageGamePage
+      },
+      onGameStatistics: (data) => {
+        console.log('WebSocket game statistics received in AdminLayout');
+        if (data.success && data.statistics) {
+          // Update notification count for badge
+          const totalPending = (
+            (data.statistics.totalPendingProfiles || 0) +
+            (data.statistics.pendingCreditRequests || 0) +
+            (data.statistics.pendingRedeemRequests || 0)
+          );
+          setNotificationCount(totalPending);
+        }
+      },
+      onError: (errorMsg) => {
+        console.error('WebSocket error in AdminLayout:', errorMsg);
+      }
+    };
+    
+    // Initialize socket with event handlers
+    initializeSocket(socketHandlers);
+    
+    // Clean up socket connection when component unmounts
+    return () => {
+      disconnectSocket();
+    };
+  }, []);
+
+  // Register service worker if needed
+  const registerServiceWorkerIfNeeded = async () => {
+    try {
+      const registration = await registerServiceWorker();
+      if (registration) {
+        console.log('Service worker registered successfully in AdminLayout:', registration);
+        setServiceWorkerRegistered(true);
+        
+        // Check for updates
+        registration.update().catch(err => {
+          console.error('Error updating service worker:', err);
+        });
+      }
+    } catch (error) {
+      console.error('Failed to register service worker:', error);
+    }
+  };
+
+  // Handle messages from service worker
+  const handleServiceWorkerMessage = (event) => {
+    console.log('Received message from service worker in AdminLayout:', event.data);
+    
+    // Handle notification click from service worker
+    if (event.data && event.data.type === 'NOTIFICATION_CLICK') {
+      console.log('Notification clicked:', event.data);
+      
+      // Navigate to the appropriate page based on notification type
+      if (event.data.notificationType === 'credit' || 
+          event.data.notificationType === 'redeem' ||
+          event.data.notificationType === 'gameId') {
+        // Navigate to manage-game page
+        navigate('/admin/manage-game');
+      }
+    }
+  };
+
+  // Request notification permission
+  const handleRequestPermission = async () => {
+    try {
+      const granted = await requestNotificationPermission();
+      const newPermission = granted ? 'granted' : 'default';
+      setNotificationPermission(newPermission);
+      
+      // If permission was granted, register service worker
+      if (newPermission === 'granted' && serviceWorkerSupported) {
+        await registerServiceWorkerIfNeeded();
+      }
+    } catch (error) {
+      console.error('Error requesting notification permission:', error);
+    }
+  };
   
   useEffect(() => {
     // Get current user data when component mounts
@@ -48,7 +204,13 @@ const AdminLayout = () => {
   const navigation = [
     { name: 'Dashboard', href: '/admin/dashboard', icon: 'home' },
     { name: 'Users', href: '/admin/users', icon: 'users' },
-    { name: 'Manage Game', href: '/admin/manage-game', icon: 'game' },
+    { 
+      name: 'Manage Game', 
+      href: '/admin/manage-game', 
+      icon: 'game',
+      hasBadge: true,
+      badgeCount: notificationCount
+    },
     { name: 'Fund Management', href: '/admin/fund-management', icon: 'money' },
     { name: 'Settings', href: '/admin/settings', icon: 'cog' },
   ];
@@ -120,6 +282,48 @@ const AdminLayout = () => {
         </div>
       )}
       
+      {/* Notification Permission Request */}
+      {notificationSupported && notificationPermission !== 'granted' && (
+        <div className="fixed bottom-0 inset-x-0 pb-2 sm:pb-5 z-50">
+          <div className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
+            <div className="p-2 rounded-lg bg-blue-500 shadow-lg sm:p-3">
+              <div className="flex items-center justify-between flex-wrap">
+                <div className="w-0 flex-1 flex items-center">
+                  <span className="flex p-2 rounded-lg bg-blue-600">
+                    <svg className="h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                    </svg>
+                  </span>
+                  <p className="ml-3 font-medium text-white truncate">
+                    {notificationPermission === 'denied' 
+                      ? "Notifications are blocked. Please enable them in your browser settings."
+                      : "Enable notifications to receive alerts for new requests."}
+                  </p>
+                </div>
+                <div className="order-3 mt-2 flex-shrink-0 w-full sm:order-2 sm:mt-0 sm:w-auto">
+                  {notificationPermission !== 'denied' && (
+                    <button
+                      onClick={handleRequestPermission}
+                      className="flex items-center justify-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-blue-600 bg-white hover:bg-blue-50"
+                    >
+                      Enable notifications
+                    </button>
+                  )}
+                </div>
+                <div className="order-2 flex-shrink-0 sm:order-3 sm:ml-2">
+                  <button type="button" className="-mr-1 flex p-2 rounded-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-white">
+                    <span className="sr-only">Dismiss</span>
+                    <svg className="h-6 w-6 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      
       {/* Sidebar for mobile */}
       <div 
         className={`fixed inset-y-0 left-0 flex flex-col z-40 w-64 bg-gray-800 text-white transform ${
@@ -155,7 +359,7 @@ const AdminLayout = () => {
                     isActive
                       ? 'bg-gray-900 text-white'
                       : 'text-gray-300 hover:bg-gray-700 hover:text-white'
-                  } group flex items-center px-2 py-2 text-sm font-medium rounded-md`}
+                  } group flex items-center px-2 py-2 text-sm font-medium rounded-md relative`}
                   onClick={() => setSidebarOpen(false)}
                 >
                   <div className={`${
@@ -164,11 +368,22 @@ const AdminLayout = () => {
                     {getIcon(item.icon)}
                   </div>
                   {item.name}
+                  
+                  {/* Badge for notification count */}
+                  {item.hasBadge && item.badgeCount > 0 && (
+                    <span className="absolute right-0 top-0 -mt-1 -mr-1 flex h-5 w-5">
+                      <span className="relative inline-flex rounded-full h-5 w-5 bg-red-500 text-xs text-white items-center justify-center">
+                        {item.badgeCount > 99 ? '99+' : item.badgeCount}
+                      </span>
+                    </span>
+                  )}
                 </Link>
               );
             })}
           </nav>
         </div>
+        
+        
         
         {/* User profile */}
         <div className="flex-shrink-0 flex border-t border-gray-700 p-4">
@@ -214,14 +429,26 @@ const AdminLayout = () => {
                 </div>
               </div>
               <div className="flex items-center">
+                {/* Connection status */}
+                {socketConnected && (
+                  <span className="mr-4 text-xs text-green-600 flex items-center">
+                    <span className="h-2 w-2 bg-green-500 rounded-full mr-1"></span>
+                    Connected
+                  </span>
+                )}
+                
                 {/* Notifications */}
-                <button className="p-2 rounded-full text-gray-400 hover:text-gray-500 relative">
+                <Link to="/admin/manage-game" className="p-2 rounded-full text-gray-400 hover:text-gray-500 relative">
                   <span className="sr-only">View notifications</span>
                   <svg className="h-6 w-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
                   </svg>
-                  <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-red-500"></span>
-                </button>
+                  {notificationCount > 0 && (
+                    <span className="absolute top-1 right-1 h-4 w-4 rounded-full bg-red-500 flex items-center justify-center text-xs text-white">
+                      {notificationCount > 9 ? '9+' : notificationCount}
+                    </span>
+                  )}
+                </Link>
                 
                 {/* Profile dropdown */}
                 <div className="ml-3 relative" ref={dropdownRef}>

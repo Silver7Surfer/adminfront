@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { createBrowserRouter, RouterProvider, Navigate } from 'react-router-dom';
+import { isServiceWorkerSupported, registerServiceWorker } from '../services/PushNotificationService';
 
 // Import layout components
 import AuthLayout from './components/layout/AuthLayout';
@@ -98,6 +99,20 @@ const router = createBrowserRouter([
 ]);
 
 function App() {
+  // Register service worker for push notifications
+  useEffect(() => {
+    // Register service worker if supported
+    if (isServiceWorkerSupported()) {
+      registerServiceWorker()
+        .then(registration => {
+          console.log('Service Worker registered successfully');
+        })
+        .catch(error => {
+          console.error('Service Worker registration failed:', error);
+        });
+    }
+  }, []);
+
   return <RouterProvider router={router} />;
 }
 

@@ -1,12 +1,15 @@
 // src/services/gameManagementService.js
 import { io } from 'socket.io-client';
 import notificationSound from '../src/assets/notification-sound.mp3';
+import { showNotification } from './PushNotificationService';
 
 const API_BASE_URL = import.meta.env.VITE_BASE_URL || 'http://localhost:5000';
 const API_ENDPOINT = `${API_BASE_URL}/api/admin/games`;
 
 // Socket instance that will be reused
 let socketInstance = null;
+// Debounce timer for API requests
+let requestDebounceTimer = null;
 
 /**
  * Get the authentication token from localStorage
@@ -38,11 +41,163 @@ const createAuthHeaders = (includeContentType = false) => {
 };
 
 /**
+ * Send system notification for new events
+ * @param {string} type - Notification type (credit, redeem, gameId, etc)
+ * @param {string} username - Username involved
+ * @param {string} gameName - Game name
+ * @returns {Promise<boolean>} Whether notification was shown
+ */
+const sendSystemNotification = async (type, username, gameName) => {
+  let title = 'New Admin Request';
+  let body = 'You have a new request to review';
+  let notificationType = 'general';
+  let url = '/admin/manage-game';
+
+  switch (type) {
+    case 'credit':
+      title = 'New Credit Request';
+      body = `${username} requested credits for ${gameName}`;
+      notificationType = 'credit';
+      break;
+    case 'redeem':
+      title = 'New Redemption Request';
+      body = `${username} requested to redeem from ${gameName}`;
+      notificationType = 'redeem';
+      break;
+    case 'gameId':
+      title = 'New Game ID Request';
+      body = `${username} needs a game ID assigned for ${gameName}`;
+      notificationType = 'gameId';
+      break;
+    default:
+      break;
+  }
+
+  return await showNotification({
+    title,
+    body,
+    icon: '/logo192.png',
+    tag: `${notificationType}-${Date.now()}`,
+    data: {
+      url,
+      type: notificationType,
+      username,
+      gameName,
+      timestamp: Date.now()
+    },
+    onClick: (data) => {
+      // Navigate to the appropriate page/tab when notification is clicked
+      window.focus();
+      window.location.href = data.url;
+    }
+  });
+};
+
+/**
+ * Check for changes in profiles that require notifications
+ * @param {Array} oldProfiles - Previous profiles
+ * @param {Array} newProfiles - New profiles
+ * @returns {Array} Array of notifications to send
+ */
+const checkForProfileChanges = (oldProfiles, newProfiles) => {
+  const notifications = [];
+  
+  if (!oldProfiles || !newProfiles || oldProfiles.length === 0) {
+    return notifications;
+  }
+  
+  // Build lookup maps for efficient checking
+  const oldProfileMap = new Map();
+  
+  oldProfiles.forEach(profile => {
+    if (!profile.games || !Array.isArray(profile.games)) return;
+    
+    const userId = profile.userId?.toString() || profile._id?.toString();
+    const username = profile.userData?.username || 'Unknown';
+    
+    profile.games.forEach(game => {
+      const key = `${userId}-${game.gameName}`;
+      oldProfileMap.set(key, {
+        profileStatus: game.profileStatus,
+        creditStatus: game.creditAmount?.status || 'none',
+        username
+      });
+    });
+  });
+  
+  // Check for changes in new profiles
+  newProfiles.forEach(profile => {
+    if (!profile.games || !Array.isArray(profile.games)) return;
+    
+    const userId = profile.userId?.toString() || profile._id?.toString();
+    const username = profile.userData?.username || 'Unknown';
+    
+    profile.games.forEach(game => {
+      const key = `${userId}-${game.gameName}`;
+      const oldData = oldProfileMap.get(key);
+      
+      // If this is a new profile or game entry
+      if (!oldData) {
+        if (game.profileStatus === 'pending') {
+          notifications.push({
+            type: 'gameId',
+            username,
+            gameName: game.gameName
+          });
+        }
+        if (game.creditAmount?.status === 'pending') {
+          notifications.push({
+            type: 'credit',
+            username,
+            gameName: game.gameName
+          });
+        }
+        if (game.creditAmount?.status === 'pending_redeem') {
+          notifications.push({
+            type: 'redeem',
+            username,
+            gameName: game.gameName
+          });
+        }
+        return;
+      }
+      
+      // Check for status changes
+      if (oldData.profileStatus !== 'pending' && game.profileStatus === 'pending') {
+        notifications.push({
+          type: 'gameId',
+          username,
+          gameName: game.gameName
+        });
+      }
+      
+      if (oldData.creditStatus !== 'pending' && game.creditAmount?.status === 'pending') {
+        notifications.push({
+          type: 'credit',
+          username,
+          gameName: game.gameName
+        });
+      }
+      
+      if (oldData.creditStatus !== 'pending_redeem' && game.creditAmount?.status === 'pending_redeem') {
+        notifications.push({
+          type: 'redeem',
+          username,
+          gameName: game.gameName
+        });
+      }
+    });
+  });
+  
+  return notifications;
+};
+
+/**
  * Initialize the WebSocket connection
- * @param {Object} handlers - Object containing event handlers
+ * @param {Object} handlers - Object containing event handlers (optional)
  * @returns {Object} The socket instance
  */
-const initializeSocket = (handlers) => {
+const initializeSocket = (handlers = {}) => {
   // Create socket connection if it doesn't exist
   if (!socketInstance) {
     socketInstance = io(API_BASE_URL, {
@@ -51,9 +206,18 @@ const initializeSocket = (handlers) => {
     });
   }
   
+  // Maintain a cache of previous profiles for comparison
+  let previousProfiles = [];
+  
   // Socket event handlers
   socketInstance.on('connect', () => {
     console.log('Connected to WebSocket server');
+    
+    // Dispatch global event for connected state
+    window.dispatchEvent(new CustomEvent('socketConnected', {
+      detail: { connected: true }
+    }));
+    
     if (handlers.onConnect) handlers.onConnect();
     
     // Authenticate with JWT token from localStorage
@@ -63,12 +227,24 @@ const initializeSocket = (handlers) => {
       socketInstance.emit('authenticate', token);
     } catch (error) {
       console.error('Authentication failed:', error.message);
+      
+      // Dispatch global error event
+      window.dispatchEvent(new CustomEvent('socketError', {
+        detail: { message: 'Authentication token not found' }
+      }));
+      
       if (handlers.onError) handlers.onError('Authentication token not found');
     }
   });
   
   socketInstance.on('disconnect', () => {
     console.log('Disconnected from WebSocket server');
+    
+    // Dispatch global event for disconnected state
+    window.dispatchEvent(new CustomEvent('socketConnected', {
+      detail: { connected: false }
+    }));
+    
     if (handlers.onDisconnect) handlers.onDisconnect();
   });
   
@@ -79,22 +255,75 @@ const initializeSocket = (handlers) => {
       if (handlers.onAuthenticated) handlers.onAuthenticated(response);
     } else {
       console.error('Socket authentication failed:', response.message);
+      
+      // Dispatch global error event
+      window.dispatchEvent(new CustomEvent('socketError', {
+        detail: { message: 'WebSocket authentication failed: ' + response.message }
+      }));
+      
       if (handlers.onError) handlers.onError('WebSocket authentication failed: ' + response.message);
     }
   });
   
   socketInstance.on('gameProfiles', (data) => {
-    console.log('Received game profiles via WebSocket:', data);
+    console.log('Received game profiles via WebSocket');
+    
+    if (data.success) {
+      // Check for changes that require notifications
+      const notifications = checkForProfileChanges(previousProfiles, data.profiles || []);
+      
+      // Send system-level notifications for new events
+      if (notifications.length > 0 && document.visibilityState !== 'visible') {
+        // Only send if the document is not visible (tab in background or minimized)
+        notifications.forEach(notification => {
+          sendSystemNotification(
+            notification.type,
+            notification.username,
+            notification.gameName
+          );
+        });
+      }
+      
+      // Update the previous profiles cache for future comparisons
+      previousProfiles = [...(data.profiles || [])];
+      
+      // Dispatch global event with profiles data - add delay to prevent event stacking
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('gameProfiles', {
+          detail: data
+        }));
+      }, 50);
+    } else {
+      // Dispatch global error event
+      window.dispatchEvent(new CustomEvent('socketError', {
+        detail: { message: data.message || 'Failed to fetch game profiles' }
+      }));
+    }
+    
     if (handlers.onGameProfiles) handlers.onGameProfiles(data);
   });
   
   socketInstance.on('gameStatistics', (data) => {
-    console.log('Received game statistics via WebSocket:', data);
+    console.log('Received game statistics via WebSocket');
+    
+    // Dispatch global event with statistics data - add delay to prevent event stacking
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('gameStatistics', {
+        detail: data
+      }));
+    }, 50);
+    
     if (handlers.onGameStatistics) handlers.onGameStatistics(data);
   });
   
   socketInstance.on('error', (error) => {
     console.error('Socket error:', error);
+    
+    // Dispatch global error event
+    window.dispatchEvent(new CustomEvent('socketError', {
+      detail: { message: error.message || 'WebSocket error occurred' }
+    }));
+    
     if (handlers.onError) handlers.onError(error.message || 'WebSocket error occurred');
   });
   
@@ -393,17 +622,6 @@ const disapproveRedeem = async (userId, gameName) => {
   }
 };
 
-/**
- * Play notification sound
- */
-const playNotificationSound = () => {
-  try {
-    const audio = new Audio(notificationSound);
-    audio.play().catch(err => console.log('Unable to play notification sound', err));
-  } catch (err) {
-    console.log('Error playing notification sound:', err);
-  }
-};
 
 /**
  * Count pending items in game profiles
@@ -503,6 +721,39 @@ const formatGameProfiles = (profiles, activeTab, searchQuery) => {
   return rows;
 };
 
+/**
+ * Broadcast updates for game profiles and statistics with debounce
+ */
+const broadcastUpdates = async (setLoading) => {
+  if (setLoading) setLoading(true);
+  
+  // Clear any pending requests
+  if (requestDebounceTimer) {
+    clearTimeout(requestDebounceTimer);
+  }
+  
+  // Debounce the request
+  requestDebounceTimer = setTimeout(() => {
+    if (isSocketConnected()) {
+      requestGameProfiles();
+      requestGameStatistics();
+      
+      // Fallback to REST if socket doesn't respond within 3 seconds
+      setTimeout(() => {
+        if (setLoading) setLoading(false);
+      }, 3000);
+    } else {
+      // Use REST API directly
+      fetchGameProfiles().catch(console.error);
+      fetchGameStatistics().catch(console.error);
+      
+      if (setLoading) setTimeout(() => setLoading(false), 500);
+    }
+    
+    requestDebounceTimer = null;
+  }, 300); // Wait 300ms before making request
+};
+
 export {
   initializeSocket,
   disconnectSocket,
@@ -516,7 +767,8 @@ export {
   disapproveCredit,
   approveRedeem,
   disapproveRedeem,
-  playNotificationSound,
   countPendingItems,
-  formatGameProfiles
+  formatGameProfiles,
+  sendSystemNotification,
+  broadcastUpdates
 };

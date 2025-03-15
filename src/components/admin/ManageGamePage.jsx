@@ -1,8 +1,5 @@
-// src/components/ManageGamePage.jsx
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  initializeSocket,
-  disconnectSocket,
   requestGameProfiles,
   requestGameStatistics,
   isSocketConnected,
@@ -13,17 +10,38 @@ import {
   disapproveCredit,
   approveRedeem,
   disapproveRedeem,
-  playNotificationSound,
   countPendingItems,
-  formatGameProfiles
+  formatGameProfiles,
+  sendSystemNotification,
+  broadcastUpdates
 } from '../../../services/gameManagementService';
+import {
+  isNotificationSupported,
+  isServiceWorkerSupported,
+  getNotificationPermission,
+  requestNotificationPermission,
+  registerServiceWorker
+} from '../../../services/PushNotificationService';
 
+// Import components
+import NotificationBadge from './ManageGame/NotificationBadge';
+import GameStatsCards from './ManageGame/GameStatsCards';
+import TabsFilter from './ManageGame/TabsFilter';
+import ErrorAlert from './ManageGame/ErrorAlert';
+import GameProfilesTable from './ManageGame/GameProfilesTable';
+import GameIdModal from './ManageGame/GameIdModal';
+import Pagination from './ManageGame/Pagination';
+import { getPaginatedRows, calculateTotalPages } from './ManageGame/tableUtils';
+
+/**
+ * Main game management container component
+ */
 const ManageGamePage = () => {
+  // State management
   const [gameProfiles, setGameProfiles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedStatus, setSelectedStatus] = useState('all');
   const [showModal, setShowModal] = useState(false);
   const [editingProfile, setEditingProfile] = useState(null);
   const [gameIdInput, setGameIdInput] = useState('');
@@ -38,81 +56,221 @@ const ManageGamePage = () => {
     pendingRedeems: 0
   });
   
-  // WebSocket connection state
+  // WebSocket and notification state
   const [socketConnected, setSocketConnected] = useState(false);
   const [newNotification, setNewNotification] = useState(false);
+  const [notificationSupported, setNotificationSupported] = useState(false);
+  const [serviceWorkerSupported, setServiceWorkerSupported] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState('default');
+  const [serviceWorkerRegistered, setServiceWorkerRegistered] = useState(false);
   
   const itemsPerPage = 10;
 
-  // Initialize WebSocket connection
+  // Check notification support on mount
+  useEffect(() => {
+    // Check if notifications are supported
+    const supported = isNotificationSupported();
+    setNotificationSupported(supported);
+    
+    // Check if service worker is supported
+    const swSupported = isServiceWorkerSupported();
+    setServiceWorkerSupported(swSupported);
+    
+    if (supported) {
+      // Get current permission status
+      const permission = getNotificationPermission();
+      setNotificationPermission(permission);
+      
+      // If permission is granted, register service worker for push notifications
+      if (permission === 'granted' && swSupported) {
+        registerServiceWorkerIfNeeded();
+      }
+    }
+    
+    // Add visibility change detector
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    
+    // Listen for messages from service worker
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    }
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (navigator.serviceWorker) {
+        navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+      }
+    };
+  }, []);
+
+  // Register service worker if needed
+  const registerServiceWorkerIfNeeded = async () => {
+    try {
+      const registration = await registerServiceWorker();
+      if (registration) {
+        console.log('Service worker registered successfully:', registration);
+        setServiceWorkerRegistered(true);
+        
+        // Check for updates
+        registration.update().catch(err => {
+          console.error('Error updating service worker:', err);
+        });
+      }
+    } catch (error) {
+      console.error('Failed to register service worker:', error);
+    }
+  };
+
+  // Handle messages from service worker
+  const handleServiceWorkerMessage = (event) => {
+    console.log('Received message from service worker:', event.data);
+    
+    // Handle notification click from service worker
+    if (event.data && event.data.type === 'NOTIFICATION_CLICK') {
+      console.log('Notification clicked:', event.data);
+      
+      // Switch to appropriate tab based on notification type
+      if (event.data.notificationType === 'credit') {
+        setActiveTab('credit');
+      } else if (event.data.notificationType === 'redeem') {
+        setActiveTab('redeem');
+      } else if (event.data.notificationType === 'gameId') {
+        setActiveTab('pending');
+      }
+      
+      // Clear the notification indicator
+      setNewNotification(false);
+    }
+  };
+
+  // Handle visibility changes
+  const handleVisibilityChange = () => {
+    const isVisible = document.visibilityState === 'visible';
+    console.log(`Document visibility changed: ${isVisible ? 'visible' : 'hidden'}`);
+    
+    // Clear in-app notification when app becomes visible again
+    if (isVisible) {
+      setNewNotification(false);
+    }
+  };
+
+  // Request notification permission
+  const handleRequestPermission = async () => {
+    try {
+      const granted = await requestNotificationPermission();
+      const newPermission = granted ? 'granted' : 'default';
+      setNotificationPermission(newPermission);
+      
+      // If permission was granted, register service worker
+      if (newPermission === 'granted' && serviceWorkerSupported) {
+        await registerServiceWorkerIfNeeded();
+      }
+    } catch (error) {
+      console.error('Error requesting notification permission:', error);
+    }
+  };
+
+  // Test notification
+  const testNotification = async () => {
+    if (notificationPermission === 'granted') {
+      await sendSystemNotification(
+        'credit',
+        'Test User',
+        'Test Game'
+      );
+    } else {
+      alert('Notification permission not granted');
+    }
+  };
+
+  // Initialize data loading and socket listeners
   useEffect(() => {
     // Initial data loading using REST API
     fetchGameProfilesFallback();
     fetchStatsFallback();
     
-    // Socket event handlers
-    const socketHandlers = {
-      onConnect: () => {
-        setSocketConnected(true);
-      },
-      onDisconnect: () => {
-        setSocketConnected(false);
-      },
-      onAuthenticated: (response) => {
-        if (response.success) {
-          // Request initial data
-          requestGameProfiles();
-          requestGameStatistics();
-        }
-      },
-      onGameProfiles: (data) => {
-        if (data.success) {
-          // Check if there are any new pending profiles
-          const previousPendingCount = countPendingItems(gameProfiles);
-          const newPendingCount = countPendingItems(data.profiles || []);
+    // Define event handlers
+    function handleGameProfiles(event) {
+      const data = event.detail;
+      console.log('Game profiles data received in ManageGamePage');
+      if (data.success) {
+        // Check if there are any new pending profiles for in-app notification badge
+        const previousPendingCount = countPendingItems(gameProfiles);
+        const newPendingCount = countPendingItems(data.profiles || []);
+        
+        if (previousPendingCount < newPendingCount && gameProfiles.length > 0) {
+          // In-app notification badge
+          setNewNotification(true);
           
-          if (previousPendingCount < newPendingCount && gameProfiles.length > 0) {
-            setNewNotification(true);
-            // Play notification sound
-            playNotificationSound();
-          }
           
-          // Log game profiles to debug Edit ID issue
-          console.log('Game profiles data:', JSON.stringify(data.profiles, null, 2));
-          
-          setGameProfiles(data.profiles || []);
-          setLoading(false);
-          setError(null);
-        } else {
-          setError(data.message || 'Failed to fetch game profiles');
-          setLoading(false);
         }
-      },
-      onGameStatistics: (data) => {
-        console.log('Received game statistics via WebSocket:', data);
-        playNotificationSound();
-        if (data.success && data.statistics) {
-          setStatsData({
-            totalProfiles: data.statistics.totalProfiles || 0,
-            pendingProfiles: data.statistics.totalPendingProfiles || 0,
-            pendingCredits: data.statistics.pendingCreditRequests || 0,
-            pendingRedeems: data.statistics.pendingRedeemRequests || 0
-          });
-        }
-      },
-      onError: (errorMsg) => {
-        setError(errorMsg || 'WebSocket error occurred');
+        
+        // Update the data
+        setGameProfiles(data.profiles || []);
+        setLoading(false);
+        setError(null);
+      } else {
+        setError(data.message || 'Failed to fetch game profiles');
         setLoading(false);
       }
-    };
+    }
     
-    // Initialize socket with event handlers
-    initializeSocket(socketHandlers);
+    function handleGameStatistics(event) {
+      const data = event.detail;
+      console.log('Game statistics received in ManageGamePage');
+      if (data.success && data.statistics) {
+        const newStats = {
+          totalProfiles: data.statistics.totalProfiles || 0,
+          pendingProfiles: data.statistics.totalPendingProfiles || 0,
+          pendingCredits: data.statistics.pendingCreditRequests || 0,
+          pendingRedeems: data.statistics.pendingRedeemRequests || 0
+        };
+        
+        // Check for changes in stats for in-app notification badge
+        if (statsData.pendingProfiles < newStats.pendingProfiles ||
+            statsData.pendingCredits < newStats.pendingCredits ||
+            statsData.pendingRedeems < newStats.pendingRedeems) {
+          
+          setNewNotification(true);
+          
+          
+        }
+        
+        setStatsData(newStats);
+      }
+    }
     
-    // Clean up socket connection when component unmounts
+    function handleSocketConnection(event) {
+      setSocketConnected(event.detail.connected);
+    }
+    
+    function handleSocketError(event) {
+      console.error('WebSocket error in ManageGamePage:', event.detail.message);
+      setError(event.detail.message || 'WebSocket error occurred');
+      setLoading(false);
+    }
+    
+    // Request data when component mounts
+    if (isSocketConnected()) {
+      requestGameProfiles();
+      requestGameStatistics();
+    }
+    
+    // Add event listeners to global events
+    window.addEventListener('gameProfiles', handleGameProfiles);
+    window.addEventListener('gameStatistics', handleGameStatistics);
+    window.addEventListener('socketConnected', handleSocketConnection);
+    window.addEventListener('socketError', handleSocketError);
+    
+    // Remove event listeners when component unmounts
     return () => {
-      disconnectSocket();
+      window.removeEventListener('gameProfiles', handleGameProfiles);
+      window.removeEventListener('gameStatistics', handleGameStatistics);
+      window.removeEventListener('socketConnected', handleSocketConnection);
+      window.removeEventListener('socketError', handleSocketError);
+      // Note: We don't disconnect the socket here as it's managed by AdminLayout
     };
+    // IMPORTANT: Empty dependency array to prevent re-running this effect when state changes
   }, []);
 
   // Fallback functions to use REST API if WebSocket fails
@@ -139,63 +297,9 @@ const ManageGamePage = () => {
     }
   };
 
-  // Refresh data function - use WebSocket if connected, otherwise REST API
-  const refreshGameProfiles = () => {
-    setNewNotification(false); // Clear notification when manually refreshing
-    setLoading(true); // Show loading state
-    
-    console.log('Manual refresh triggered');
-    
-    if (isSocketConnected()) {
-      console.log('Using WebSocket for manual refresh');
-      requestGameProfiles();
-      
-      // Add a fallback timer in case the socket request fails or times out
-      const fallbackTimer = setTimeout(() => {
-        console.log('Socket response timeout, falling back to REST API');
-        fetchGameProfilesFallback();
-      }, 3000); // 3 second timeout
-      
-      return () => {
-        clearTimeout(fallbackTimer);
-      };
-    } else {
-      console.log('Using REST API for manual refresh (no socket connection)');
-      fetchGameProfilesFallback();
-    }
-  };
-
-  const refreshStats = () => {
-    if (isSocketConnected()) {
-      requestGameStatistics();
-    } else {
-      fetchStatsFallback();
-    }
-  };
-
-  // Function to broadcast updates after API calls
-  const broadcastUpdates = async () => {
-    setLoading(true);
-    console.log('Broadcasting updates after action');
-    
-    if (isSocketConnected()) {
-      console.log('Using WebSocket for updates');
-      requestGameProfiles();
-      requestGameStatistics();
-      
-      // Fallback to REST if socket doesn't respond within 3 seconds
-      setTimeout(() => {
-        if (loading) {
-          console.log('Socket not responding fast enough, using REST API');
-          fetchGameProfilesFallback();
-          fetchStatsFallback();
-        }
-      }, 3000);
-    } else {
-      console.log('Using REST API for updates (no socket connection)');
-      await fetchGameProfilesFallback();
-      await fetchStatsFallback();
-    }
+  // Function to broadcast updates after API calls (with debounce)
+  const handleBroadcastUpdates = async () => {
+    broadcastUpdates(setLoading);
   };
 
   // Function to convert game profiles to table rows
@@ -203,18 +307,14 @@ const ManageGamePage = () => {
     return formatGameProfiles(gameProfiles, activeTab, searchQuery);
   };
 
-  // Pagination
-  const paginatedRows = () => {
-    const allRows = getProfileRows();
-    const startIndex = (currentPage - 1) * itemsPerPage;
-    const endIndex = startIndex + itemsPerPage;
-    return allRows.slice(startIndex, endIndex);
+  // Event handlers
+  const handleTabChange = (tab) => {
+    setActiveTab(tab);
+    setNewNotification(false);
+    setCurrentPage(1); // Reset to first page when changing tabs
   };
 
-  const totalPages = Math.ceil(getProfileRows().length / itemsPerPage);
-
   const handleEditClick = (row) => {
-    console.log('Edit clicked for row:', row);
     setEditingProfile({
       userId: row.userId,
       username: row.username,
@@ -229,6 +329,7 @@ const ManageGamePage = () => {
     setShowModal(false);
     setEditingProfile(null);
     setGameIdInput('');
+    setPasswordInput('');
   };
 
   const handleSaveGameId = async () => {
@@ -239,17 +340,15 @@ const ManageGamePage = () => {
   
     try {
       setSubmitting(true);
-      console.log('Saving game ID and password:', gameIdInput, passwordInput);
       
-      // Send both gameId and password to the backend
       await assignGameId(
         editingProfile.userId, 
         editingProfile.gameName, 
         gameIdInput.trim(),
-        passwordInput.trim() // Include password
+        passwordInput.trim()
       );
       
-      await broadcastUpdates(); // Request updates after successful save
+      await handleBroadcastUpdates(); // Request updates after successful save
       handleCloseModal();
     } catch (error) {
       console.error('Error assigning game ID:', error);
@@ -262,10 +361,9 @@ const ManageGamePage = () => {
   const handleApproveCredit = async (row) => {
     try {
       setSubmitting(true);
-      console.log('Approving credit for:', row);
       
       await approveCredit(row.userId, row.gameName);
-      await broadcastUpdates(); // Request updates after successful approval
+      await handleBroadcastUpdates(); // Request updates after successful approval
     } catch (error) {
       console.error('Error approving credit:', error);
       setError('Failed to approve credit: ' + error.message);
@@ -281,10 +379,9 @@ const ManageGamePage = () => {
     
     try {
       setSubmitting(true);
-      console.log('Disapproving credit for:', row);
       
       await disapproveCredit(row.userId, row.gameName);
-      await broadcastUpdates(); // Request updates after successful disapproval
+      await handleBroadcastUpdates(); // Request updates after successful disapproval
     } catch (error) {
       console.error('Error disapproving credit:', error);
       setError('Failed to disapprove credit: ' + error.message);
@@ -296,10 +393,9 @@ const ManageGamePage = () => {
   const handleApproveRedeem = async (row) => {
     try {
       setSubmitting(true);
-      console.log('Approving redeem for:', row);
       
       await approveRedeem(row.userId, row.gameName);
-      await broadcastUpdates(); // Request updates after successful approval
+      await handleBroadcastUpdates(); // Request updates after successful approval
     } catch (error) {
       console.error('Error approving redeem:', error);
       setError('Failed to approve redeem: ' + error.message);
@@ -315,10 +411,9 @@ const ManageGamePage = () => {
     
     try {
       setSubmitting(true);
-      console.log('Disapproving redeem for:', row);
       
       await disapproveRedeem(row.userId, row.gameName);
-      await broadcastUpdates(); // Request updates after successful disapproval
+      await handleBroadcastUpdates(); // Request updates after successful disapproval
     } catch (error) {
       console.error('Error disapproving redeem:', error);
       setError('Failed to disapprove redeem: ' + error.message);
@@ -327,597 +422,156 @@ const ManageGamePage = () => {
     }
   };
 
-  // Get status tag component
-  const StatusTag = ({ status, type = 'profile' }) => {
-    let bgColor = 'bg-gray-100';
-    let textColor = 'text-gray-800';
-    let label = status;
+  // Calculate pagination data
+  const allRows = getProfileRows();
+  const paginatedRows = getPaginatedRows(allRows, currentPage, itemsPerPage);
+  const totalPages = calculateTotalPages(allRows.length, itemsPerPage);
 
-    if (type === 'profile') {
-      if (status === 'active') {
-        bgColor = 'bg-green-100';
-        textColor = 'text-green-800';
-      } else if (status === 'pending') {
-        bgColor = 'bg-yellow-100';
-        textColor = 'text-yellow-800';
-      }
-    } else if (type === 'credit') {
-      if (status === 'pending') {
-        bgColor = 'bg-blue-100';
-        textColor = 'text-blue-800';
-        label = 'Credit Pending';
-      } else if (status === 'pending_redeem') {
-        bgColor = 'bg-purple-100';
-        textColor = 'text-purple-800';
-        label = 'Redeem Pending';
-      } else if (status === 'success') {
-        bgColor = 'bg-green-100';
-        textColor = 'text-green-800';
-        label = 'Active';
-      }
-    }
-
-    return (
-      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${bgColor} ${textColor}`}>
-        {label}
-      </span>
-    );
-  };
   return (
     <div className="px-6 py-6 max-w-full">
-      {/* Notification Badge */}
-      {newNotification && (
-        <div 
-          className="fixed top-4 right-4 bg-red-500 text-white px-4 py-2 rounded-lg shadow-lg animate-pulse z-50 cursor-pointer"
-          onClick={() => setNewNotification(false)}
-        >
-          <div className="flex items-center">
-            <svg className="w-6 h-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
-            </svg>
-            <span>New game profile updates</span>
+      {/* Notification Permission Request */}
+      {notificationSupported && notificationPermission !== 'granted' && (
+        <div className="bg-blue-50 border border-blue-200 rounded-md p-4 mb-6">
+          <div className="flex">
+            <div className="flex-shrink-0">
+              <svg className="h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2h-1V9z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="ml-3 flex-1 md:flex md:justify-between">
+              <p className="text-sm text-blue-700">
+                {notificationPermission === 'denied' 
+                  ? "Notifications are blocked. Please enable them in your browser settings."
+                  : serviceWorkerSupported
+                    ? "Enable push notifications to receive alerts even when the app is closed."
+                    : "Enable notifications to receive alerts when the app is in the background."}
+              </p>
+              <div className="mt-3 text-sm md:mt-0 md:ml-6">
+                {notificationPermission !== 'denied' && (
+                  <button 
+                    onClick={handleRequestPermission}
+                    className="whitespace-nowrap font-medium text-blue-700 hover:text-blue-600"
+                  >
+                    Enable notifications
+                    <span aria-hidden="true"> &rarr;</span>
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
+      
+      {/* Show service worker status for debugging in development mode */}
+      {process.env.NODE_ENV === 'development' && serviceWorkerSupported && notificationPermission === 'granted' && (
+        <div className="bg-green-50 border border-green-200 rounded-md p-4 mb-6">
+          <div className="flex">
+            <div className="flex-shrink-0">
+              <svg className="h-5 w-5 text-green-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="ml-3 flex-1 md:flex md:justify-between">
+              <p className="text-sm text-green-700">
+                {navigator.serviceWorker && navigator.serviceWorker.controller 
+                  ? "Service Worker is active. You'll receive notifications even when the app is closed."
+                  : "Service Worker is registered but not yet controlling the page. Refresh to activate."}
+              </p>
+              <div className="mt-3 text-sm md:mt-0 md:ml-6">
+                <button
+                  onClick={testNotification}
+                  className="whitespace-nowrap font-medium text-green-700 hover:text-green-600"
+                >
+                  Test notification
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      
   
       <div className="mb-8 flex justify-between items-center">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Game Management</h1>
           <p className="mt-1 text-gray-600">Manage game profiles and handle credit/redeem requests</p>
         </div>
-        {socketConnected && (
-          <span className="text-xs text-green-600 flex items-center">
-            <span className="h-2 w-2 bg-green-500 rounded-full mr-1"></span>
-            Live Updates
-          </span>
-        )}
+        <div className="flex items-center space-x-2">
+          {socketConnected && (
+            <span className="text-xs text-green-600 flex items-center">
+              <span className="h-2 w-2 bg-green-500 rounded-full mr-1"></span>
+              Live Updates
+            </span>
+          )}
+          {serviceWorkerRegistered && notificationPermission === 'granted' && (
+            <span className="text-xs text-blue-600 flex items-center">
+              <span className="h-2 w-2 bg-blue-500 rounded-full mr-1"></span>
+              Push Notifications
+            </span>
+          )}
+        </div>
       </div>
   
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
-          <div className="flex items-center">
-            <div className="flex-shrink-0 bg-indigo-500 rounded-md p-3">
-              <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-              </svg>
-            </div>
-            <div className="ml-5">
-              <div className="text-sm font-medium text-gray-500">Total Profiles</div>
-              <div className="mt-1 text-2xl font-semibold text-gray-900">{statsData.totalProfiles}</div>
-            </div>
-          </div>
-        </div>
-  
-        <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
-          <div className="flex items-center">
-            <div className="flex-shrink-0 bg-yellow-500 rounded-md p-3">
-              <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            </div>
-            <div className="ml-5">
-              <div className="text-sm font-medium text-gray-500">Pending Profiles</div>
-              <div className="mt-1 text-2xl font-semibold text-gray-900">{statsData.pendingProfiles}</div>
-            </div>
-          </div>
-        </div>
-  
-        <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
-          <div className="flex items-center">
-            <div className="flex-shrink-0 bg-blue-500 rounded-md p-3">
-              <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
-              </svg>
-            </div>
-            <div className="ml-5">
-              <div className="text-sm font-medium text-gray-500">Credit Requests</div>
-              <div className="mt-1 text-2xl font-semibold text-gray-900">{statsData.pendingCredits}</div>
-            </div>
-          </div>
-        </div>
-  
-        <div className="bg-white shadow-sm rounded-lg p-5 border border-gray-200">
-          <div className="flex items-center">
-            <div className="flex-shrink-0 bg-purple-500 rounded-md p-3">
-              <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
-              </svg>
-            </div>
-            <div className="ml-5">
-              <div className="text-sm font-medium text-gray-500">Redeem Requests</div>
-              <div className="mt-1 text-2xl font-semibold text-gray-900">{statsData.pendingRedeems}</div>
-            </div>
-          </div>
-        </div>
-      </div>
+      <GameStatsCards statsData={statsData} />
   
       {/* Filters and tabs */}
-      <div className="mb-6">
-        <div className="sm:flex sm:items-center sm:justify-between">
-          <div className="flex-1">
-            <div className="flex space-x-1 rounded-lg bg-gray-100 p-1">
-              <button
-                onClick={() => {
-                  setActiveTab('all');
-                  setNewNotification(false);
-                }}
-                className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
-                  activeTab === 'all' 
-                    ? 'bg-white text-gray-900 shadow-sm' 
-                    : 'text-gray-500 hover:text-gray-900'
-                }`}
-              >
-                All Profiles
-              </button>
-              <button
-                onClick={() => {
-                  setActiveTab('pending');
-                  setNewNotification(false);
-                }}
-                className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
-                  activeTab === 'pending' 
-                    ? 'bg-white text-gray-900 shadow-sm' 
-                    : 'text-gray-500 hover:text-gray-900'
-                }`}
-              >
-                Pending Profiles {statsData.pendingProfiles > 0 && `(${statsData.pendingProfiles})`}
-              </button>
-              <button
-                onClick={() => {
-                  setActiveTab('credit');
-                  setNewNotification(false);
-                }}
-                className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
-                  activeTab === 'credit' 
-                    ? 'bg-white text-gray-900 shadow-sm' 
-                    : 'text-gray-500 hover:text-gray-900'
-                }`}
-              >
-                Credit Requests {statsData.pendingCredits > 0 && `(${statsData.pendingCredits})`}
-              </button>
-              <button
-                onClick={() => {
-                  setActiveTab('redeem');
-                  setNewNotification(false);
-                }}
-                className={`flex-1 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium ${
-                  activeTab === 'redeem' 
-                    ? 'bg-white text-gray-900 shadow-sm' 
-                    : 'text-gray-500 hover:text-gray-900'
-                }`}
-              >
-                Redeem Requests {statsData.pendingRedeems > 0 && `(${statsData.pendingRedeems})`}
-              </button>
-            </div>
-          </div>
-          <div className="mt-4 sm:mt-0 sm:ml-4">
-            <div className="flex space-x-2">
-              <div className="relative flex-grow">
-                <input
-                  type="text"
-                  placeholder="Search..."
-                  className="block w-full rounded-md border-0 py-1.5 pr-10 text-gray-900 shadow-sm ring-1 ring-inset ring-gray-300 placeholder:text-gray-400 focus:ring-2 focus:ring-inset focus:ring-indigo-600 sm:text-sm sm:leading-6"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3">
-                  <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                  </svg>
-                </div>
-              </div>
-              <button
-                onClick={() => {
-                  setNewNotification(false);
-                  broadcastUpdates();
-                }}
-                disabled={submitting || loading}
-                className="inline-flex items-center rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
-              >
-                {loading ? (
-                  <svg className="animate-spin h-4 w-4 mr-1" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                  </svg>
-                ) : (
-                  <svg className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                )}
-                {loading ? 'Loading...' : 'Refresh'}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+      <TabsFilter
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        onRefresh={handleBroadcastUpdates}
+        isLoading={loading}
+        isSubmitting={submitting}
+        statsData={statsData}
+      />
   
       {/* Error display */}
-      {error && (
-        <div className="rounded-md bg-red-50 p-4 mb-6">
-          <div className="flex">
-            <div className="flex-shrink-0">
-              <svg className="h-5 w-5 text-red-400" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-              </svg>
-            </div>
-            <div className="ml-3">
-              <h3 className="text-sm font-medium text-red-800">{error}</h3>
-            </div>
-            <div className="ml-auto pl-3">
-              <div className="-mx-1.5 -my-1.5">
-                <button
-                  onClick={() => setError(null)}
-                  className="inline-flex rounded-md bg-red-50 p-1.5 text-red-500 hover:bg-red-100 focus:outline-none focus:ring-2 focus:ring-red-600 focus:ring-offset-2 focus:ring-offset-red-50"
-                >
-                  <span className="sr-only">Dismiss</span>
-                  <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                    <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <ErrorAlert 
+        error={error} 
+        onDismiss={() => setError(null)} 
+      />
   
       {/* Game Profiles Table */}
-      {loading ? (
-        <div className="flex flex-col items-center justify-center h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-          <p className="mt-3 text-sm text-gray-500">Loading game profiles...</p>
-        </div>
-      ) : (
-        <>
-          <div className="overflow-x-auto bg-white shadow-sm ring-1 ring-gray-200 sm:rounded-lg">
-            {getProfileRows().length > 0 ? (
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th scope="col" className="py-3.5 pl-4 pr-3 text-left text-sm font-semibold text-gray-900 sm:pl-6">User</th>
-                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game</th>
-                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Game ID</th>
-                    <th scope="col" className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">Status</th>
-                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
-                      Credit Amount
-                    </th>
-                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">
-                      Requested
-                    </th>
-                    <th scope="col" className="px-3 py-3.5 text-right text-sm font-semibold text-gray-900">Date</th>
-                    <th scope="col" className="relative py-3.5 pl-3 pr-4 sm:pr-6">
-                      <span className="sr-only">Actions</span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200 bg-white">
-                  {paginatedRows().map((row, index) => (
-                    <tr key={`${row.userId}-${row.gameName}-${index}`}>
-                      <td className="whitespace-nowrap py-4 pl-4 pr-3 text-sm sm:pl-6">
-                        <div className="flex items-center">
-                          <div className="h-10 w-10 flex-shrink-0 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 flex items-center justify-center">
-                            <span className="text-xs font-medium text-white">
-                              {row.username.charAt(0).toUpperCase()}
-                            </span>
-                          </div>
-                          <div className="ml-4">
-                            <div className="font-medium text-gray-900">{row.username}</div>
-                            <div className="text-gray-500">{row.email}</div>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-900">{row.gameName}</td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-700">
-                        {row.gameId === 'Not assigned' ? (
-                          <span className="text-gray-400 italic">Not assigned</span>
-                        ) : (
-                          row.gameId
-                        )}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm">
-                        <StatusTag status={row.profileStatus} type="profile" />
-                        {row.creditStatus !== 'none' && (
-                          <span className="ml-2">
-                            <StatusTag status={row.creditStatus} type="credit" />
-                          </span>
-                        )}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-900">
-                        ${row.creditAmount.toFixed(2)}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right">
-                        {row.requestedAmount > 0 ? (
-                          <span className="font-medium text-gray-900">
-                            ${row.requestedAmount.toFixed(2)}
-                          </span>
-                        ) : (
-                          <span className="text-gray-400">-</span>
-                        )}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-4 text-sm text-right text-gray-500">
-                        {row.createdAt}
-                      </td>
-                      <td className="whitespace-nowrap py-4 pl-3 pr-4 text-right text-sm font-medium sm:pr-6">
-                        {row.profileStatus === 'pending' && (
-                          <button
-                            type="button"
-                            onClick={() => handleEditClick(row)}
-                            className="text-indigo-600 hover:text-indigo-900 mr-3"
-                            disabled={submitting}
-                          >
-                            Assign ID
-                          </button>
-                        )}
-                        
-                        {row.creditStatus === 'pending' && (
-                          <div className="flex space-x-2 justify-end">
-                            <button
-                              type="button"
-                              onClick={() => handleApproveCredit(row)}
-                              className="text-green-600 hover:text-green-900"
-                              disabled={submitting}
-                            >
-                              Approve
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDisapproveCredit(row)}
-                              className="text-red-600 hover:text-red-900"
-                              disabled={submitting}
-                            >
-                              Decline
-                            </button>
-                          </div>
-                        )}
-                        
-                        {row.creditStatus === 'pending_redeem' && (
-                          <div className="flex space-x-2 justify-end">
-                            <button
-                              type="button"
-                              onClick={() => handleApproveRedeem(row)}
-                              className="text-green-600 hover:text-green-900"
-                              disabled={submitting}
-                            >
-                              Approve
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDisapproveRedeem(row)}
-                              className="text-red-600 hover:text-red-900"
-                              disabled={submitting}
-                            >
-                              Decline
-                            </button>
-                          </div>
-                        )}
-                        
-                        {row.profileStatus === 'active' && row.creditStatus === 'none' && (
-                          <button
-                            type="button"
-                            onClick={() => handleEditClick(row)}
-                            className="text-indigo-600 hover:text-indigo-900"
-                            disabled={submitting}
-                          >
-                            Edit ID
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <div className="py-16 text-center">
-                <svg
-                  className="mx-auto h-12 w-12 text-gray-400"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  aria-hidden="true"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                  />
-                </svg>
-                <h3 className="mt-2 text-sm font-medium text-gray-900">No game profiles</h3>
-                <p className="mt-1 text-sm text-gray-500">
-                  No game profiles found matching your criteria.
-                </p>
-              </div>
-            )}
-          </div>
-  
-          {/* Pagination */}
-          {getProfileRows().length > 0 && (
-            <div className="flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6 mt-4 rounded-md">
-              <div className="flex flex-1 justify-between sm:hidden">
-                <button
-                  onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-                  disabled={currentPage === 1}
-                  className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                >
-                  Previous
-                </button>
-                <button
-                  onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-                  disabled={currentPage === totalPages}
-                  className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                >
-                  Next
-                </button>
-              </div>
-              <div className="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
-                <div>
-                  <p className="text-sm text-gray-700">
-                    Showing <span className="font-medium">{Math.min((currentPage - 1) * itemsPerPage + 1, getProfileRows().length)}</span> to{' '}
-                    <span className="font-medium">{Math.min(currentPage * itemsPerPage, getProfileRows().length)}</span> of{' '}
-                    <span className="font-medium">{getProfileRows().length}</span> results
-                  </p>
-                </div>
-                <div>
-                  <nav className="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
-                    <button
-                      onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-                      disabled={currentPage === 1}
-                      className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-                    >
-                      <span className="sr-only">Previous</span>
-                      <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                        <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 01-.02 1.06L8.832 10l3.938 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clipRule="evenodd" />
-                      </svg>
-                    </button>
-                    
-                    {/* Page numbers */}
-                    {[...Array(totalPages)].map((_, i) => (
-                      <button
-                        key={i}
-                        onClick={() => setCurrentPage(i + 1)}
-                        className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${
-                          currentPage === i + 1
-                            ? 'z-10 bg-indigo-600 text-white focus:z-20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600'
-                            : 'text-gray-900 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0'
-                        }`}
-                      >
-                        {i + 1}
-                      </button>
-                    ))}
-                    
-                    <button
-                      onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-                      disabled={currentPage === totalPages}
-                      className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 disabled:opacity-50"
-                    >
-                      <span className="sr-only">Next</span>
-                      <svg className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                        <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
-                      </svg>
-                    </button>
-                  </nav>
-                </div>
-              </div>
-            </div>
-          )}
-        </>
-      )}
-      
-  
-        {/* Game ID Assignment Modal */}
-      {showModal && (
-        <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
-            <div className="flex items-start justify-between mb-5">
-              <h3 className="text-lg font-medium leading-6 text-gray-900">
-                {editingProfile.currentGameId ? 'Edit Game ID' : 'Assign Game ID'}
-              </h3>
-              <button
-                type="button"
-                className="rounded-md bg-white text-gray-400 hover:text-gray-500 focus:outline-none"
-                onClick={handleCloseModal}
-              >
-                <span className="sr-only">Close</span>
-                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <div className="mt-2">
-              <div className="mb-4">
-                <div className="px-5 py-4 bg-gray-50 rounded-lg border border-gray-200 shadow-sm">
-                  <div className="flex items-center text-sm">
-                    <span className="font-semibold text-gray-600 w-24">Username:</span>
-                    <span className="ml-2 text-gray-900 font-medium">{editingProfile.username}</span>
-                  </div>
-                  <div className="mt-2 flex items-center text-sm">
-                    <span className="font-semibold text-gray-600 w-24">Game:</span>
-                    <span className="ml-2 text-gray-900 font-medium">{editingProfile.gameName}</span>
-                  </div>
-                </div>
-              </div>
-              
-              <div className="mb-5">
-                <label htmlFor="gameId" className="block text-sm font-medium text-gray-700 mb-2">
-                  Game ID
-                </label>
-                <div className="relative rounded-md shadow-sm">
-                  <input
-                    type="text"
-                    name="gameId"
-                    id="gameId"
-                    className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-                    placeholder="Enter game ID"
-                    value={gameIdInput}
-                    onChange={(e) => setGameIdInput(e.target.value)}
-                    autoFocus
-                  />
-                </div>
-              </div>
-              <div className="mb-5">
-          <label htmlFor="gamePassword" className="block text-sm font-medium text-gray-700 mb-2">
-            Game Password
-          </label>
-          <div className="relative rounded-md shadow-sm">
-            <input
-              type="text"
-              name="gamePassword"
-              id="gamePassword"
-              className="block w-full px-4 py-2.5 sm:text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-              placeholder="Enter game password"
-              value={passwordInput}
-              onChange={(e) => setPasswordInput(e.target.value)}
-            />
-          </div>
-        </div>
-            </div>
-            
-            <div className="mt-5 flex justify-end gap-3">
-              <button
-                type="button"
-                className="inline-flex justify-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
-                onClick={handleCloseModal}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="inline-flex justify-center rounded-md border border-transparent bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:ring-offset-2"
-                onClick={handleSaveGameId}
-                disabled={submitting}
-              >
-                {submitting ? 'Saving...' : 'Save'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <GameProfilesTable
+        rows={paginatedRows}
+        loading={loading}
+        submitting={submitting}
+        onEditClick={handleEditClick}
+        onApproveCredit={handleApproveCredit}
+        onDisapproveCredit={handleDisapproveCredit}
+        onApproveRedeem={handleApproveRedeem}
+        onDisapproveRedeem={handleDisapproveRedeem}
+      />
+
+      {/* Pagination */}
+      <Pagination
+        currentPage={currentPage}
+        totalPages={totalPages}
+        onPageChange={setCurrentPage}
+        totalItems={allRows.length}
+        itemsPerPage={itemsPerPage}
+      />
 
       {/* Show total count */}
       <div className="mt-4 text-sm text-gray-600">
-        Showing {getProfileRows().length} game profiles
+        Showing {allRows.length} game profiles
       </div>
+      
+      {/* Game ID Assignment Modal */}
+      <GameIdModal
+        show={showModal}
+        profile={editingProfile}
+        gameIdInput={gameIdInput}
+        onGameIdChange={setGameIdInput}
+        passwordInput={passwordInput}
+        onPasswordChange={setPasswordInput}
+        submitting={submitting}
+        onClose={handleCloseModal}
+        onSave={handleSaveGameId}
+      />
     </div>
   );
 };
