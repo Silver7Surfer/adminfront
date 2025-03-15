@@ -5,8 +5,11 @@ import {
   disconnectSocket,
   requestGameProfiles,
   requestGameStatistics,
-  isSocketConnected
-} from '../../../services/gameManagementService';
+  requestPendingWithdrawals,
+  isSocketConnected,
+  registerGameManagementHandlers,
+  registerWithdrawalManagementHandlers
+} from '../../../services/UnifiedSocketService';
 import {
   isNotificationSupported,
   isServiceWorkerSupported,
@@ -20,6 +23,7 @@ const AdminLayout = () => {
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
   const [user, setUser] = useState(null);
   const [notificationCount, setNotificationCount] = useState(0);
+  const [withdrawalCount, setWithdrawalCount] = useState(0);
   const [socketConnected, setSocketConnected] = useState(false);
   const [notificationSupported, setNotificationSupported] = useState(false);
   const [serviceWorkerSupported, setServiceWorkerSupported] = useState(false);
@@ -63,20 +67,74 @@ const AdminLayout = () => {
     };
   }, []);
   
+  // Listen for game notifications
+  useEffect(() => {
+    // Function to handle game notifications
+    const handleGameNotifications = (event) => {
+      const data = event.detail;
+      if (data.success && data.statistics) {
+        // Update notification count for badge
+        const totalPending = (
+          (data.statistics.totalPendingProfiles || 0) +
+          (data.statistics.pendingCreditRequests || 0) +
+          (data.statistics.pendingRedeemRequests || 0)
+        );
+        setNotificationCount(totalPending);
+      }
+    };
+
+    // Add event listener
+    window.addEventListener('gameStatistics', handleGameNotifications);
+    
+    // Clean up
+    return () => {
+      window.removeEventListener('gameStatistics', handleGameNotifications);
+    };
+  }, []);
+  
+  // Listen for withdrawal notifications
+  useEffect(() => {
+    // Function to handle withdrawal notifications
+    const handleWithdrawalNotifications = (event) => {
+      const data = event.detail;
+      if (data.success && data.pendingWithdrawals) {
+        // Count pending withdrawals
+        const pendingCount = data.pendingWithdrawals.filter(w => w.status === 'pending').length;
+        setWithdrawalCount(pendingCount);
+      }
+    };
+
+    // Add event listener
+    window.addEventListener('pendingWithdrawals', handleWithdrawalNotifications);
+    
+    // Clean up
+    return () => {
+      window.removeEventListener('pendingWithdrawals', handleWithdrawalNotifications);
+    };
+  }, []);
+  
   // Initialize WebSocket connection
   useEffect(() => {
-    // Socket event handlers
-    const socketHandlers = {
+    console.log('AdminLayout: Initializing unified socket');
+    
+    // Set up socket connection status handler
+    const handleSocketConnection = (event) => {
+      setSocketConnected(event.detail.connected);
+    };
+    
+    // Add connection status listener
+    window.addEventListener('socketConnected', handleSocketConnection);
+    
+    // Register game management event handlers
+    registerGameManagementHandlers({
       onConnect: () => {
-        console.log('WebSocket connected in AdminLayout');
-        setSocketConnected(true);
+        console.log('Game management connected in AdminLayout');
       },
       onDisconnect: () => {
-        console.log('WebSocket disconnected in AdminLayout');
-        setSocketConnected(false);
+        console.log('Game management disconnected in AdminLayout');
       },
       onAuthenticated: (response) => {
-        console.log('WebSocket authenticated in AdminLayout', response);
+        console.log('Game management authenticated in AdminLayout', response);
         if (response.success) {
           // Request initial data
           requestGameProfiles();
@@ -84,11 +142,11 @@ const AdminLayout = () => {
         }
       },
       onGameProfiles: (data) => {
-        console.log('WebSocket game profiles received in AdminLayout');
+        console.log('Game profiles received in AdminLayout');
         // Just update connection status - actual data handling is in ManageGamePage
       },
       onGameStatistics: (data) => {
-        console.log('WebSocket game statistics received in AdminLayout');
+        console.log('Game statistics received in AdminLayout');
         if (data.success && data.statistics) {
           // Update notification count for badge
           const totalPending = (
@@ -100,15 +158,41 @@ const AdminLayout = () => {
         }
       },
       onError: (errorMsg) => {
-        console.error('WebSocket error in AdminLayout:', errorMsg);
+        console.error('Game management error in AdminLayout:', errorMsg);
       }
-    };
+    });
     
-    // Initialize socket with event handlers
-    initializeSocket(socketHandlers);
+    // Register withdrawal management event handlers
+    registerWithdrawalManagementHandlers({
+      onAuthSuccess: (response) => {
+        console.log('Withdrawal management authenticated in AdminLayout', response);
+        if (response.success) {
+          // Request initial withdrawal data
+          requestPendingWithdrawals();
+        }
+      },
+      onAuthFailure: (errorMsg) => {
+        console.error('Withdrawal authentication failed in AdminLayout:', errorMsg);
+      },
+      onWithdrawalsReceived: (data) => {
+        console.log('Withdrawal data received in AdminLayout');
+        if (data.success && data.pendingWithdrawals) {
+          // Count pending withdrawals
+          const pendingCount = data.pendingWithdrawals.filter(w => w.status === 'pending').length;
+          setWithdrawalCount(pendingCount);
+        }
+      },
+      onError: (errorMsg) => {
+        console.error('Withdrawal management error in AdminLayout:', errorMsg);
+      }
+    });
     
-    // Clean up socket connection when component unmounts
+    // Initialize the socket connection
+    initializeSocket();
+    
+    // Clean up
     return () => {
+      window.removeEventListener('socketConnected', handleSocketConnection);
       disconnectSocket();
     };
   }, []);
@@ -145,6 +229,9 @@ const AdminLayout = () => {
           event.data.notificationType === 'gameId') {
         // Navigate to manage-game page
         navigate('/admin/manage-game');
+      } else if (event.data.notificationType === 'withdrawal') {
+        // Navigate to fund management page
+        navigate('/admin/fund-management');
       }
     }
   };
@@ -165,6 +252,7 @@ const AdminLayout = () => {
     }
   };
   
+  // Load user data and setup click handlers
   useEffect(() => {
     // Get current user data when component mounts
     const token = localStorage.getItem('accessToken');
@@ -201,6 +289,21 @@ const AdminLayout = () => {
     };
   }, []);
   
+  // Monitor route changes to ensure socket connection
+  useEffect(() => {
+    console.log(`AdminLayout: Route changed to ${location.pathname}`);
+    
+    // Request fresh data when changing pages
+    if (isSocketConnected()) {
+      if (location.pathname === '/admin/manage-game') {
+        requestGameProfiles();
+        requestGameStatistics();
+      } else if (location.pathname === '/admin/fund-management') {
+        requestPendingWithdrawals();
+      }
+    }
+  }, [location.pathname]);
+  
   const navigation = [
     { name: 'Dashboard', href: '/admin/dashboard', icon: 'home' },
     { name: 'Users', href: '/admin/users', icon: 'users' },
@@ -211,7 +314,13 @@ const AdminLayout = () => {
       hasBadge: true,
       badgeCount: notificationCount
     },
-    { name: 'Fund Management', href: '/admin/fund-management', icon: 'money' },
+    { 
+      name: 'Fund Management', 
+      href: '/admin/fund-management', 
+      icon: 'money',
+      hasBadge: true,
+      badgeCount: withdrawalCount
+    },
     { name: 'Settings', href: '/admin/settings', icon: 'cog' },
   ];
   
@@ -383,8 +492,6 @@ const AdminLayout = () => {
           </nav>
         </div>
         
-        
-        
         {/* User profile */}
         <div className="flex-shrink-0 flex border-t border-gray-700 p-4">
           <div className="flex items-center">
@@ -437,18 +544,34 @@ const AdminLayout = () => {
                   </span>
                 )}
                 
-                {/* Notifications */}
-                <Link to="/admin/manage-game" className="p-2 rounded-full text-gray-400 hover:text-gray-500 relative">
-                  <span className="sr-only">View notifications</span>
-                  <svg className="h-6 w-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
-                  </svg>
-                  {notificationCount > 0 && (
-                    <span className="absolute top-1 right-1 h-4 w-4 rounded-full bg-red-500 flex items-center justify-center text-xs text-white">
-                      {notificationCount > 9 ? '9+' : notificationCount}
-                    </span>
-                  )}
-                </Link>
+                {/* Notifications - Display both types of notifications */}
+                <div className="flex items-center">
+                  {/* Game notifications */}
+                  <Link to="/admin/manage-game" className="p-2 rounded-full text-gray-400 hover:text-gray-500 relative">
+                    <span className="sr-only">View game notifications</span>
+                    <svg className="h-6 w-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                    </svg>
+                    {notificationCount > 0 && (
+                      <span className="absolute top-1 right-1 h-4 w-4 rounded-full bg-red-500 flex items-center justify-center text-xs text-white">
+                        {notificationCount > 9 ? '9+' : notificationCount}
+                      </span>
+                    )}
+                  </Link>
+                  
+                  {/* Withdrawal notifications */}
+                  <Link to="/admin/fund-management" className="p-2 rounded-full text-gray-400 hover:text-gray-500 relative">
+                    <span className="sr-only">View withdrawal notifications</span>
+                    <svg className="h-6 w-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    {withdrawalCount > 0 && (
+                      <span className="absolute top-1 right-1 h-4 w-4 rounded-full bg-red-500 flex items-center justify-center text-xs text-white">
+                        {withdrawalCount > 9 ? '9+' : withdrawalCount}
+                      </span>
+                    )}
+                  </Link>
+                </div>
                 
                 {/* Profile dropdown */}
                 <div className="ml-3 relative" ref={dropdownRef}>

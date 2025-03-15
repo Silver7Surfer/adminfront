@@ -7,9 +7,6 @@ import {
   fetchPendingWithdrawals,
   approveWithdrawal,
   disapproveWithdrawal,
-  playNotificationSound,
-  showBrowserNotification,
-  requestNotificationPermission,
   formatDate,
   getNetworkLabel,
   copyToClipboard
@@ -78,11 +75,8 @@ const WithdrawalManagementPanel = () => {
           setNewNotification(true);
           
           // Play notification sound and show browser notification
-          playNotificationSound();
-          showBrowserNotification(
-            'New Withdrawal Requests', 
-            `${additionalCount} new withdrawal request${additionalCount > 1 ? 's' : ''} pending`
-          );
+          
+          
         }
         
         // Update state with new withdrawals
@@ -109,11 +103,6 @@ const WithdrawalManagementPanel = () => {
     );
     
     // Request browser notification permission on component mount
-    if ("Notification" in window && 
-        Notification.permission !== 'granted' && 
-        Notification.permission !== 'denied') {
-      requestNotificationPermission();
-    }
     
     // Clean up socket connection when component unmounts
     return () => {

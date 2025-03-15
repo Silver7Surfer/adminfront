@@ -1,8 +1,7 @@
 // src/services/withdrawalManagementService.js
 import { io } from 'socket.io-client';
-import notificationSound from '../src/assets/notification-sound.mp3';
 
-const API_BASE_URL =  import.meta.env.VITE_BASE_URL || 'http://localhost:5000';
+const API_BASE_URL = import.meta.env.VITE_BASE_URL || 'http://localhost:5000';
 const API_ENDPOINT = `${API_BASE_URL}/api/admin/withdrawals`;
 
 // Socket reference that can be used across function calls
@@ -86,6 +85,22 @@ const initializeSocket = (onAuthSuccess, onAuthFailure, onWithdrawalsReceived, o
   
   socketInstance.on('pendingWithdrawals', (data) => {
     console.log('Received pending withdrawals via WebSocket:', data);
+    
+    if (data.success) {
+      // Dispatch global event with withdrawals data - add delay to prevent event stacking
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('pendingWithdrawals', {
+          detail: data
+        }));
+      }, 50);
+    } else {
+      // Dispatch global error event
+      window.dispatchEvent(new CustomEvent('socketError', {
+        detail: { message: data.message || 'Failed to fetch pending withdrawals' }
+      }));
+    }
+    
+    // Call the original callback
     if (socketListeners.onWithdrawalsReceived) socketListeners.onWithdrawalsReceived(data);
   });
   
@@ -162,6 +177,12 @@ const fetchPendingWithdrawals = async () => {
     
     if (data.success) {
       console.log("Pending withdrawals (REST API):", data.pendingWithdrawals);
+      
+      // Dispatch global event with the data
+      window.dispatchEvent(new CustomEvent('pendingWithdrawals', {
+        detail: data
+      }));
+      
       return data.pendingWithdrawals || [];
     } else {
       throw new Error(data.message || 'Failed to fetch pending withdrawals');
@@ -197,6 +218,8 @@ const approveWithdrawal = async (withdrawal, txHash = '') => {
     const data = await response.json();
     
     if (data.success) {
+      // Request updated withdrawal data after successful approval
+      requestPendingWithdrawals();
       return data;
     } else {
       throw new Error(data.message || 'Failed to approve withdrawal');
@@ -230,6 +253,8 @@ const disapproveWithdrawal = async (withdrawal) => {
     const data = await response.json();
     
     if (data.success) {
+      // Request updated withdrawal data after successful disapproval
+      requestPendingWithdrawals();
       return data;
     } else {
       throw new Error(data.message || 'Failed to reject withdrawal');
@@ -238,49 +263,6 @@ const disapproveWithdrawal = async (withdrawal) => {
     console.error('Error rejecting withdrawal:', err);
     throw err;
   }
-};
-
-/**
- * Play notification sound
- */
-const playNotificationSound = () => {
-  try {
-    const audio = new Audio(notificationSound);
-    audio.play().catch(err => console.log('Unable to play notification sound', err));
-  } catch (err) {
-    console.log('Error playing notification sound:', err);
-  }
-};
-
-/**
- * Show browser notification
- * @param {string} title - Notification title
- * @param {string} body - Notification body
- * @param {string} icon - Notification icon path
- */
-const showBrowserNotification = (title, body, icon = '/favicon.ico') => {
-  if ("Notification" in window && Notification.permission === 'granted') {
-    new Notification(title, {
-      body,
-      icon
-    });
-  }
-};
-
-/**
- * Request browser notification permission
- * @returns {Promise<string>} Permission status
- */
-const requestNotificationPermission = async () => {
-  if (!("Notification" in window)) {
-    return 'not-supported';
-  }
-  
-  if (Notification.permission !== "granted") {
-    return await Notification.requestPermission();
-  }
-  
-  return Notification.permission;
 };
 
 /**
@@ -331,9 +313,6 @@ export {
   fetchPendingWithdrawals,
   approveWithdrawal,
   disapproveWithdrawal,
-  playNotificationSound,
-  showBrowserNotification,
-  requestNotificationPermission,
   formatDate,
   getNetworkLabel,
   copyToClipboard
